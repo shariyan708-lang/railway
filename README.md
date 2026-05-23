@@ -24,6 +24,9 @@ This is a normal Telegram bot, not a Telegram Mini App and not a website. Users 
 - Delivered keys and invite links are sent as separate copy-friendly messages
 - Manual top-up request and admin approval
 - Order notification to admins with user, product, variant, days and price
+- Admin order/top-up notifications include View Details and User Orders buttons
+- Admin-managed redeem codes with value and max usage limit
+- Profile page is clean, with separate order history and full TXT export
 - Neon PostgreSQL support through `DATABASE_URL`
 - SQLite fallback for local testing
 - Optimized database indexes, cached settings, cached successful join checks and fast bulk stock insert
@@ -152,6 +155,20 @@ Set these from `/admin > Settings`:
 - `Info Text`: text shown when user taps `Info Bot`
 - `Redeem Text`: text shown when user taps `Redeem`
 
+## Redeem Codes
+
+Admins can create wallet redeem codes from `/admin > Redeem Codes`.
+
+Send:
+
+```text
+FREE10
+10
+10
+```
+
+This creates code `FREE10`, value `$10`, usable by 10 different users. Each user can claim the same code only once.
+
 ## Product and Stock Flow
 
 1. Admin opens `/admin`.
@@ -196,3 +213,5 @@ https://t.me/yourchannel
 ```
 
 The third line is important. It must be `@channelusername` or the numeric channel chat ID, and the bot must be admin/member in that channel so Telegram can verify joins.
+
+For private channels, use the numeric channel chat ID. Invite links such as `https://t.me/+...` cannot be verified by Telegram unless the bot also has a real chat ID and access to that channel.

@@ -206,6 +206,7 @@ Important:
 - Third line-এ `@channelusername` অথবা numeric chat ID দিতে হবে।
 - Verify button কাজ করার জন্য bot-কে ওই channel-এ admin/member রাখতে হবে।
 - User Verify চাপলে bot fresh Telegram check করবে। Join না থাকলে alert-এ কোন channel বাকি আছে দেখাবে।
+- Private channel হলে invite link `https://t.me/+...` দিয়ে verify করা যায় না। Third line-এ numeric channel chat ID দিন এবং bot-কে channel admin/member রাখুন।
 
 ## 8. Product, Variant, Stock Setup
 
@@ -262,6 +263,42 @@ Customer purchase flow:
 4. Variant select করলে quantity page আসবে: `1x`, `2x`, `3x`, অথবা `Custom Quantity`।
 5. Confirm page-এ balance, total, after purchase balance দেখাবে।
 6. Confirm করলে success page-এ license key monospace format-এ দেখাবে, যাতে tap-hold করে copy করা যায়।
+
+## 8.1 Redeem Code Setup
+
+Admin account থেকে:
+
+1. `/admin`
+2. `Redeem Codes`
+3. `Add Redeem Code`
+4. এই format-এ পাঠান:
+
+```text
+FREE10
+10
+10
+```
+
+এখানে:
+
+- `FREE10` = redeem code
+- `10` = এক user claim করলে কত dollar/balance add হবে
+- `10` = মোট কতজন user এই code claim করতে পারবে
+
+User `Redeem` চাপলে code পাঠাবে। Code valid হলে balance automatic add হবে। একই user একই code একবারের বেশি claim করতে পারবে না।
+
+## 8.2 Profile and Order History
+
+User `Profile` চাপলে শুধু basic info দেখাবে:
+
+- Name
+- User ID
+- Username
+- Member since
+- Wallet
+- Invite count
+
+Profile-এর নিচে `Order History` button থাকবে। এখানে latest orders দেখা যাবে। `Export Full TXT` চাপলে সব order text file হিসেবে bot পাঠাবে।
 
 ## 9. Stock দেখা বা Delete করা
 

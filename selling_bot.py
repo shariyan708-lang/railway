@@ -11,6 +11,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -95,6 +96,15 @@ def normalize_chat_id(link: str, chat_id: str) -> str:
         if slug and not slug.startswith(("+", "joinchat/")):
             return f"@{slug}"
     return raw
+
+
+def chat_id_candidates(link: str, chat_id: str) -> list[str]:
+    candidates: list[str] = []
+    for value in (chat_id, normalize_chat_id(link, chat_id), normalize_chat_id(link, "")):
+        value = (value or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+    return candidates
 
 
 def chunk_text(text: str, limit: int = MAX_TEXT) -> list[str]:
@@ -300,6 +310,28 @@ class Store:
                     updated_at TEXT NOT NULL
                 )
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS redeem_codes (
+                    code TEXT PRIMARY KEY,
+                    amount_cents INTEGER NOT NULL,
+                    max_uses INTEGER NOT NULL,
+                    used_count INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_by BIGINT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS redeem_claims (
+                    id BIGSERIAL PRIMARY KEY,
+                    code TEXT NOT NULL REFERENCES redeem_codes(code) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL REFERENCES users(user_id),
+                    amount_cents INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(code, user_id)
+                )
+                """,
                 "CREATE TABLE IF NOT EXISTS admin_states (admin_id BIGINT PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL)",
                 "CREATE TABLE IF NOT EXISTS audit_logs (id BIGSERIAL PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL)",
             ]
@@ -402,6 +434,28 @@ class Store:
                     updated_at TEXT NOT NULL
                 )
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS redeem_codes (
+                    code TEXT PRIMARY KEY,
+                    amount_cents INTEGER NOT NULL,
+                    max_uses INTEGER NOT NULL,
+                    used_count INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_by INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS redeem_claims (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT NOT NULL REFERENCES redeem_codes(code) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(user_id),
+                    amount_cents INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(code, user_id)
+                )
+                """,
                 "CREATE TABLE IF NOT EXISTS admin_states (admin_id INTEGER PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL)",
                 "CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL)",
             ]
@@ -425,6 +479,8 @@ class Store:
             "CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_topups_status_created ON topups(status, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_redeem_codes_active ON redeem_codes(active, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_redeem_claims_user ON redeem_claims(user_id, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_admin_states_updated ON admin_states(updated_at)",
         ]
         with self.lock:
@@ -1082,6 +1138,89 @@ class Store:
                 self.rollback()
                 raise
 
+    def create_redeem_code(self, code: str, amount_cents: int, max_uses: int, admin_id: int) -> None:
+        stamp = now_iso()
+        clean_code = code.strip().upper()
+        self.execute(
+            """
+            INSERT INTO redeem_codes(code, amount_cents, max_uses, used_count, active, created_by, created_at, updated_at)
+            VALUES(?, ?, ?, 0, 1, ?, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+                amount_cents = excluded.amount_cents,
+                max_uses = excluded.max_uses,
+                active = 1,
+                updated_at = excluded.updated_at
+            """,
+            (clean_code, amount_cents, max_uses, admin_id, stamp, stamp),
+        )
+
+    def redeem_codes(self, limit: int = 20) -> list[Any]:
+        return self.execute(
+            "SELECT * FROM redeem_codes ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+            all_rows=True,
+        )
+
+    def toggle_redeem_code(self, code: str) -> None:
+        self.execute(
+            "UPDATE redeem_codes SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END, updated_at = ? WHERE code = ?",
+            (now_iso(), code.strip().upper()),
+        )
+
+    def delete_redeem_code(self, code: str) -> None:
+        self.execute("DELETE FROM redeem_codes WHERE code = ?", (code.strip().upper(),))
+
+    def claim_redeem_code(self, user_id: int, code: str) -> dict[str, Any]:
+        clean_code = code.strip().upper()
+        stamp = now_iso()
+        with self.lock:
+            self.begin()
+            try:
+                row = self.conn.execute(
+                    self.q("SELECT * FROM redeem_codes WHERE code = ?"),
+                    (clean_code,),
+                ).fetchone()
+                if not row or not int(row["active"]):
+                    self.rollback()
+                    return {"ok": False, "reason": "invalid"}
+                existing = self.conn.execute(
+                    self.q("SELECT id FROM redeem_claims WHERE code = ? AND user_id = ?"),
+                    (clean_code, user_id),
+                ).fetchone()
+                if existing:
+                    self.rollback()
+                    return {"ok": False, "reason": "already_claimed"}
+                if int(row["used_count"]) >= int(row["max_uses"]):
+                    self.rollback()
+                    return {"ok": False, "reason": "used_up"}
+                amount = int(row["amount_cents"])
+                self.conn.execute(
+                    self.q("UPDATE users SET balance_cents = balance_cents + ?, updated_at = ? WHERE user_id = ?"),
+                    (amount, stamp, user_id),
+                )
+                self.conn.execute(
+                    self.q("UPDATE redeem_codes SET used_count = used_count + 1, updated_at = ? WHERE code = ?"),
+                    (stamp, clean_code),
+                )
+                self.conn.execute(
+                    self.q("INSERT INTO redeem_claims(code, user_id, amount_cents, created_at) VALUES(?, ?, ?, ?)"),
+                    (clean_code, user_id, amount, stamp),
+                )
+                user = self.conn.execute(
+                    self.q("SELECT balance_cents FROM users WHERE user_id = ?"),
+                    (user_id,),
+                ).fetchone()
+                self.commit()
+                return {
+                    "ok": True,
+                    "code": clean_code,
+                    "amount_cents": amount,
+                    "new_balance_cents": int(user["balance_cents"]) if user else amount,
+                }
+            except Exception:
+                self.rollback()
+                raise
+
     def orders(self, limit: int = 15, user_id: int | None = None) -> list[Any]:
         where = ""
         params: list[Any] = []
@@ -1104,6 +1243,13 @@ class Store:
             tuple(params),
             all_rows=True,
         )
+
+    def order_count(self, user_id: int | None = None) -> int:
+        if user_id is None:
+            row = self.execute("SELECT COUNT(*) AS n FROM orders", one=True)
+        else:
+            row = self.execute("SELECT COUNT(*) AS n FROM orders WHERE user_id = ?", (user_id,), one=True)
+        return int(row["n"])
 
     def stats(self) -> dict[str, int]:
         row = self.execute(
@@ -1182,6 +1328,52 @@ class TelegramAPI:
                 payload["parse_mode"] = parse_mode
             last = self.request("sendMessage", payload)
         return last
+
+    def send_document(
+        self,
+        chat_id: int | str,
+        filename: str,
+        content: str,
+        caption: str = "",
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self.token:
+            return {"ok": False, "description": "BOT_TOKEN is missing"}
+        boundary = "----CodexTelegramBoundary" + uuid.uuid4().hex
+        body = bytearray()
+
+        def add_field(name: str, value: str) -> None:
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+            body.extend(str(value).encode("utf-8"))
+            body.extend(b"\r\n")
+
+        add_field("chat_id", str(chat_id))
+        if caption:
+            add_field("caption", caption)
+        if reply_markup:
+            add_field("reply_markup", json.dumps(reply_markup, separators=(",", ":")))
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n".encode("utf-8")
+        )
+        body.extend(content.encode("utf-8"))
+        body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+        req = urllib.request.Request(
+            self.base + "sendDocument",
+            data=bytes(body),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        try:
+            with self.opener.open(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return {"ok": False, "description": exc.read().decode("utf-8", "replace")}
+        except Exception as exc:
+            return {"ok": False, "description": str(exc)}
 
     def edit_message(
         self,
@@ -1358,6 +1550,9 @@ class BotApp:
         if state and state[0] == "custom_quantity" and not text.startswith("/"):
             self.handle_custom_quantity(chat_id, user_id, text, state[1])
             return
+        if state and state[0] == "redeem_code" and not text.startswith("/"):
+            self.handle_redeem_claim(chat_id, user_id, text)
+            return
         button = text.lower()
         if command in {"/start", "/menu"}:
             self.show_user_home(chat_id, user)
@@ -1372,7 +1567,7 @@ class BotApp:
         elif command == "/info" or "info bot" in button:
             self.show_info_bot(chat_id)
         elif "redeem" in button:
-            self.api.send_message(chat_id, self.store.setting("redeem_text"), self.reply_keyboard())
+            self.show_redeem(chat_id, user_id)
         elif command == "/topup":
             self.show_topup(chat_id)
         elif command == "/orders":
@@ -1462,13 +1657,15 @@ class BotApp:
         elif data == "u:info":
             self.show_info_bot(chat_id, message_id=message_id)
         elif data == "u:redeem":
-            self.api.send_message(chat_id, self.store.setting("redeem_text"), self.user_keyboard())
+            self.show_redeem(chat_id, user_id, message_id=message_id)
         elif data == "u:balance":
             self.show_balance(chat_id, user_id, message_id=message_id)
         elif data == "u:topup":
             self.show_topup(chat_id)
         elif data == "u:orders":
             self.show_user_orders(chat_id, user_id, message_id=message_id)
+        elif data == "u:orders_export":
+            self.export_user_orders(chat_id, user_id)
         elif data == "u:help":
             self.api.send_message(chat_id, self.store.setting("help_text"), self.user_keyboard())
         elif data == "u:contact":
@@ -1514,12 +1711,18 @@ class BotApp:
         missing: list[str] = []
         for index, channel in enumerate(channels, start=1):
             title = str(channel["title"] or f"Channel {index}")
-            chat_id = normalize_chat_id(str(channel["link"] or ""), str(channel["chat_id"] or ""))
-            if not chat_id:
+            candidates = chat_id_candidates(str(channel["link"] or ""), str(channel["chat_id"] or ""))
+            if not candidates:
                 missing.append(title)
                 continue
-            response = self.api.get_chat_member(chat_id, user_id)
-            if not response.get("ok"):
+            ok = False
+            response: dict[str, Any] = {}
+            for candidate in candidates:
+                response = self.api.get_chat_member(candidate, user_id)
+                if response.get("ok"):
+                    ok = True
+                    break
+            if not ok:
                 missing.append(title)
                 continue
             result = response.get("result", {})
@@ -1622,7 +1825,6 @@ class BotApp:
 
     def show_profile(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
         user = self.store.user(user_id)
-        orders = self.store.orders(limit=5, user_id=user_id)
         username = f"@{user['username']}" if user and user["username"] else "-"
         lines = [
             "💳 <b>MY PROFILE</b>",
@@ -1635,13 +1837,14 @@ class BotApp:
             "",
             f"💰 Wallet: {html_bold(money(int(user['balance_cents']) if user else 0, self.currency()))}",
             f"👥 Invites: {html_bold(self.store.referral_count(user_id))}",
-            f"🛒 Orders: {html_bold(len(orders))} latest shown",
         ]
-        for order in orders:
-            lines.append(
-                f"#{order['id']} {order['product_emoji'] or '📦'} {html_escape(order['product_title'])} / {html_escape(order['variant_title'])} - {html_bold(money(order['price_cents'], self.currency()))}"
-            )
-        self.page(chat_id, "\n".join(lines), self.user_keyboard(), message_id, parse_mode="HTML")
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "📦 Order History", "callback_data": "u:orders"}],
+                [{"text": "⬅️ Back", "callback_data": "u:home"}],
+            ]
+        }
+        self.page(chat_id, "\n".join(lines), keyboard, message_id, parse_mode="HTML")
 
     def show_info_bot(self, chat_id: int, message_id: int | None = None) -> None:
         owner_url = self.store.setting("owner_url", "").strip()
@@ -1675,7 +1878,7 @@ class BotApp:
         if not products:
             self.page(chat_id, "🛒 BUY KEY\n\nNo products are available right now.", self.user_keyboard(), message_id)
             return
-        rows = [[{"text": f"{p['emoji'] or '📦'} {p['title']} ({p['variant_count']} variants)", "callback_data": f"u:p:{p['id']}"}] for p in products]
+        rows = [[{"text": f"{p['emoji'] or '📦'} {p['title']}", "callback_data": f"u:p:{p['id']}"}] for p in products]
         rows.append([{"text": "⬅️ Back", "callback_data": "u:home"}])
         self.page(chat_id, "🛒 BUY KEY\n\nSelect a product:", {"inline_keyboard": rows}, message_id)
 
@@ -1896,7 +2099,8 @@ class BotApp:
             f"{variant['product_emoji'] or '📦'} Product: {variant['product_title']}\n"
             f"⏳ Duration: {duration}\n"
             f"📦 Quantity: {result.get('quantity', quantity)}\n"
-            f"💰 Total: {money(result['price_cents'], self.currency())}"
+            f"💰 Total: {money(result['price_cents'], self.currency())}",
+            self.admin_user_link_keyboard(user_id),
         )
 
     def show_balance(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
@@ -1906,6 +2110,45 @@ class BotApp:
 
     def show_topup(self, chat_id: int) -> None:
         self.api.send_message(chat_id, self.store.setting("payment_methods"), self.user_keyboard())
+
+    def show_redeem(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
+        self.store.set_state(user_id, "redeem_code")
+        text = (
+            "🎁 <b>REDEEM CODE</b>\n"
+            f"{LINE}\n\n"
+            "Send your redeem code to claim balance.\n\n"
+            "Example:\n"
+            f"{html_code('FREE10')}\n\n"
+            "/cancel to stop."
+        )
+        keyboard = {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": "u:home"}]]}
+        self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
+
+    def handle_redeem_claim(self, chat_id: int, user_id: int, text: str) -> None:
+        code = text.strip().upper()
+        if not code:
+            self.api.send_message(chat_id, "Send a valid redeem code.\n/cancel to stop.")
+            return
+        result = self.store.claim_redeem_code(user_id, code)
+        self.store.clear_state(user_id)
+        if not result.get("ok"):
+            reason = result.get("reason")
+            messages = {
+                "invalid": "Invalid or inactive redeem code.",
+                "already_claimed": "You already claimed this redeem code.",
+                "used_up": "This redeem code has reached its usage limit.",
+            }
+            self.api.send_message(chat_id, f"❌ {messages.get(reason, 'Redeem failed.')}", self.user_keyboard())
+            return
+        self.api.send_message(
+            chat_id,
+            "✅ <b>REDEEM SUCCESSFUL</b>\n\n"
+            f"🎁 Code: {html_code(result['code'])}\n"
+            f"💰 Added: {html_bold(money(result['amount_cents'], self.currency()))}\n"
+            f"💳 New Balance: {html_bold(money(result['new_balance_cents'], self.currency()))}",
+            self.user_keyboard(),
+            parse_mode="HTML",
+        )
 
     def handle_pay(self, chat_id: int, user_id: int, text: str) -> None:
         parts = text.split(maxsplit=2)
@@ -1923,20 +2166,58 @@ class BotApp:
             f"ID: {topup_id}\n"
             f"User ID: {user_id}\n"
             f"Amount: {money(amount, self.currency())}\n"
-            f"Reference: {parts[2]}"
+            f"Reference: {parts[2]}",
+            self.admin_user_link_keyboard(user_id),
         )
 
     def show_user_orders(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
-        orders = self.store.orders(user_id=user_id)
+        orders = self.store.orders(limit=15, user_id=user_id)
+        total = self.store.order_count(user_id)
         if not orders:
-            self.page(chat_id, "🛒 ORDERS\n\nNo orders yet.", self.user_keyboard(), message_id)
+            self.page(chat_id, "📦 <b>ORDER HISTORY</b>\n\nNo orders yet.", self.user_keyboard(), message_id, parse_mode="HTML")
             return
-        lines = ["Your latest orders:"]
-        for o in orders:
+        lines = ["📦 <b>ORDER HISTORY</b>", LINE, ""]
+        for index, o in enumerate(orders, start=1):
+            key_text = str(o["delivered_content"] or "-").strip()
+            date_text = str(o["created_at"] or "")[:10]
+            duration = f"{int(o['days'] or 0)}d"
             lines.append(
-                f"#{o['id']} - {o['product_title']} / {o['variant_title']} - {money(o['price_cents'], self.currency())} - {o['created_at'][:10]}"
+                f"{index}. {o['product_emoji'] or '📦'} {html_escape(o['product_title'])} ({duration})\n"
+                f"🔑 {html_code(key_text)}\n"
+                f"{html_bold(money(o['price_cents'], self.currency()))} · {html_escape(date_text)}\n"
             )
-        self.page(chat_id, "\n".join(lines), self.user_keyboard(), message_id)
+        if total > len(orders):
+            lines.append(f"<i>+{total - len(orders)} more (export for full list)</i>\n")
+        lines.append(LINE)
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "📥 Export Full TXT", "callback_data": "u:orders_export"}],
+                [{"text": "⬅️ Back", "callback_data": "u:profile"}],
+            ]
+        }
+        self.page(chat_id, "\n".join(lines), keyboard, message_id, parse_mode="HTML")
+
+    def export_user_orders(self, chat_id: int, user_id: int) -> None:
+        orders = self.store.orders(limit=1000, user_id=user_id)
+        if not orders:
+            self.api.send_message(chat_id, "No orders to export.", self.user_keyboard())
+            return
+        lines = [f"Order history for user {user_id}", ""]
+        for index, o in enumerate(orders, start=1):
+            key_text = str(o["delivered_content"] or "-").strip()
+            duration = f"{int(o['days'] or 0)}d"
+            lines.append(f"{index}. {o['product_emoji'] or '📦'} {o['product_title']} ({duration})")
+            lines.append(f"Key: {key_text}")
+            lines.append(f"Price: {money(o['price_cents'], self.currency())}")
+            lines.append(f"Date: {str(o['created_at'])[:10]}")
+            lines.append("")
+        self.api.send_document(
+            chat_id,
+            f"orders-{user_id}.txt",
+            "\n".join(lines),
+            caption="📥 Full order history export",
+            reply_markup=self.user_keyboard(),
+        )
 
     def admin_keyboard(self) -> dict[str, Any]:
         return {
@@ -1944,7 +2225,8 @@ class BotApp:
                 [{"text": "📦 Products", "callback_data": "adm:products"}, {"text": "➕ Add Product", "callback_data": "adm:add_product"}],
                 [{"text": "👥 Users", "callback_data": "adm:users:0"}, {"text": "💰 Balance", "callback_data": "adm:balances:0"}],
                 [{"text": "📣 Broadcast", "callback_data": "adm:broadcast"}, {"text": "💬 Direct Message", "callback_data": "adm:dm"}],
-                [{"text": "💭 Channels", "callback_data": "adm:channels"}, {"text": "⚙️ Settings", "callback_data": "adm:settings"}],
+                [{"text": "💭 Channels", "callback_data": "adm:channels"}, {"text": "🎁 Redeem Codes", "callback_data": "adm:redeems"}],
+                [{"text": "⚙️ Settings", "callback_data": "adm:settings"}],
                 [{"text": "🛒 Orders", "callback_data": "adm:orders"}, {"text": "⏳ Top-ups", "callback_data": "adm:topups"}],
             ]
         }
@@ -1965,6 +2247,7 @@ class BotApp:
             "┣ 💎 Custom Pricing: open a user, then set variant custom price\n"
             "┣ 📣 Broadcast: send one message to every active user\n"
             "┣ 💭 Channels: forced join channel links and verify chat IDs\n"
+            "┣ 🎁 Redeem Codes: create claim codes with value and usage limit\n"
             "┗ ⚙️ Settings: owner/channel/info/help/payment texts\n"
         )
 
@@ -2025,6 +2308,29 @@ class BotApp:
             self.admin_users(chat_id, int(data.rsplit(":", 1)[1]), balance_only=False, message_id=message_id)
         elif data.startswith("adm:balances:"):
             self.admin_users(chat_id, int(data.rsplit(":", 1)[1]), balance_only=True, message_id=message_id)
+        elif data == "adm:redeems":
+            self.admin_redeems(chat_id, message_id=message_id)
+        elif data == "adm:add_redeem":
+            self.store.set_state(admin_id, "add_redeem")
+            self.api.send_message(
+                chat_id,
+                "🎁 Add redeem code\n\n"
+                "Send:\n"
+                "Code\n"
+                "Value\n"
+                "Max users\n\n"
+                "Example:\n"
+                "FREE10\n"
+                "10\n"
+                "10\n\n"
+                "This means 10 users can claim $10 each.\n/cancel to stop.",
+            )
+        elif data.startswith("adm:toggle_redeem:"):
+            self.store.toggle_redeem_code(data.split(":", 2)[2])
+            self.admin_redeems(chat_id, message_id=message_id)
+        elif data.startswith("adm:del_redeem:"):
+            self.store.delete_redeem_code(data.split(":", 2)[2])
+            self.admin_redeems(chat_id, message_id=message_id)
         elif data.startswith("au:"):
             self.handle_user_admin(chat_id, admin_id, data, message_id)
         elif data == "adm:broadcast":
@@ -2088,10 +2394,39 @@ class BotApp:
         ]
         for p in self.store.products(active_only=False):
             status = "active" if int(p["active"]) else "hidden"
-            text.append(f"#{p['id']} {p['emoji'] or '📦'} {p['title']} - {p['variant_count']} variants - {status}")
+            text.append(f"#{p['id']} {p['emoji'] or '📦'} {p['title']} - {status}")
             rows.append([{"text": f"#{p['id']} {p['emoji'] or '📦'} {p['title']}", "callback_data": f"ap:view:{p['id']}"}])
-        rows.append([{"text": "Add Product", "callback_data": "adm:add_product"}, {"text": "Back", "callback_data": "adm:home"}])
+        rows.append([{"text": "➕ Add Product", "callback_data": "adm:add_product"}, {"text": "⬅️ Back", "callback_data": "adm:home"}])
         self.page(chat_id, "\n".join(text) if len(text) > 5 else "No products yet.", {"inline_keyboard": rows}, message_id)
+
+    def admin_redeems(self, chat_id: int, message_id: int | None = None) -> None:
+        codes = self.store.redeem_codes(limit=25)
+        lines = [
+            "🎁 REDEEM CODES",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "Create codes users can claim for wallet balance. Each code has value and max user limit.",
+            "",
+        ]
+        rows = []
+        if not codes:
+            lines.append("No redeem codes yet.")
+        for code in codes:
+            status = "✅ active" if int(code["active"]) else "⛔ disabled"
+            lines.append(
+                f"🎁 {html_code(code['code'])}\n"
+                f"┣ 💰 Value: {html_bold(money(code['amount_cents'], self.currency()))}\n"
+                f"┣ 👥 Used: {html_bold(str(code['used_count']))}/{html_bold(str(code['max_uses']))}\n"
+                f"┗ 📌 Status: {status}\n"
+            )
+            rows.append(
+                [
+                    {"text": f"🔁 Toggle {code['code']}", "callback_data": f"adm:toggle_redeem:{code['code']}"},
+                    {"text": f"🗑 Delete {code['code']}", "callback_data": f"adm:del_redeem:{code['code']}"},
+                ]
+            )
+        rows.append([{"text": "➕ Add Redeem Code", "callback_data": "adm:add_redeem"}])
+        rows.append([{"text": "⬅️ Back", "callback_data": "adm:home"}])
+        self.page(chat_id, "\n".join(lines), {"inline_keyboard": rows}, message_id, parse_mode="HTML")
 
     def handle_product_admin(self, chat_id: int, admin_id: int, data: str, message_id: int | None = None) -> None:
         parts = data.split(":")
@@ -2225,9 +2560,9 @@ class BotApp:
             username = f"@{user['username']}" if user["username"] else "-"
             status = "🚫 banned" if int(user["is_banned"]) else "✅ active"
             lines.append(
-                f"🆔 {user['user_id']}\n"
-                f"👤 {username} | {user['first_name'] or '-'}\n"
-                f"💰 {money(user['balance_cents'], self.currency())} | {status}\n"
+                f"🆔 {html_code(user['user_id'])}\n"
+                f"👤 {html_code(username)} | {html_escape(user['first_name'] or '-')}\n"
+                f"💰 {html_bold(money(user['balance_cents'], self.currency()))} | {status}\n"
             )
             rows.append([{"text": f"👤 {user['user_id']} {username}", "callback_data": f"au:view:{user['user_id']}"}])
         nav = []
@@ -2238,7 +2573,7 @@ class BotApp:
         if nav:
             rows.append(nav)
         rows.append([{"text": "⬅️ Back", "callback_data": "adm:home"}])
-        self.page(chat_id, "\n".join(lines), {"inline_keyboard": rows}, message_id)
+        self.page(chat_id, "\n".join(lines), {"inline_keyboard": rows}, message_id, parse_mode="HTML")
 
     def handle_user_admin(self, chat_id: int, admin_id: int, data: str, message_id: int | None = None) -> None:
         parts = data.split(":")
@@ -2276,12 +2611,12 @@ class BotApp:
             "👤 USER DETAILS\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Manage this customer's wallet, access, custom price, orders and direct messages.\n\n"
-            f"🆔 User ID: {user['user_id']}\n"
-            f"🔗 Username: {username}\n"
-            f"👤 Name: {user['first_name']} {user['last_name'] or ''}\n"
-            f"💰 Balance: {money(user['balance_cents'], self.currency())}\n"
+            f"🆔 User ID: {html_code(user['user_id'])}\n"
+            f"🔗 Username: {html_code(username)}\n"
+            f"👤 Name: {html_escape((user['first_name'] or '') + ' ' + (user['last_name'] or ''))}\n"
+            f"💰 Balance: {html_bold(money(user['balance_cents'], self.currency()))}\n"
             f"📌 Status: {'🚫 banned' if int(user['is_banned']) else '✅ active'}\n"
-            f"📅 Joined Bot: {user['created_at'][:19]}"
+            f"📅 Joined Bot: {html_code(user['created_at'][:19])}"
         )
         ban_button = {"text": "🔓 Unban", "callback_data": f"au:unban:{user_id}"} if int(user["is_banned"]) else {"text": "🔒 Ban", "callback_data": f"au:ban:{user_id}"}
         keyboard = {
@@ -2292,7 +2627,7 @@ class BotApp:
                 [{"text": "⬅️ Back to Users", "callback_data": "adm:users:0"}],
             ]
         }
-        self.page(chat_id, text, keyboard, message_id)
+        self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
 
     def admin_channels(self, chat_id: int, message_id: int | None = None) -> None:
         channels = self.store.channels(enabled_only=False)
@@ -2305,15 +2640,19 @@ class BotApp:
         ]
         rows = []
         for ch in channels:
-            lines.append(f"#{ch['id']} {ch['title']} - {'enabled' if int(ch['enabled']) else 'disabled'}\n{ch['link']}\nchat: {ch['chat_id'] or '-'}")
+            lines.append(
+                f"#{ch['id']} {html_escape(ch['title'])} - {'✅ enabled' if int(ch['enabled']) else '⛔ disabled'}\n"
+                f"🔗 Link: {html_code(ch['link'])}\n"
+                f"💬 Chat ID: {html_code(ch['chat_id'] or '-')}"
+            )
             rows.append(
                 [
-                    {"text": f"Toggle #{ch['id']}", "callback_data": f"adm:toggle_channel:{ch['id']}"},
-                    {"text": f"Delete #{ch['id']}", "callback_data": f"adm:del_channel:{ch['id']}"},
+                    {"text": f"🔁 Toggle #{ch['id']}", "callback_data": f"adm:toggle_channel:{ch['id']}"},
+                    {"text": f"🗑 Delete #{ch['id']}", "callback_data": f"adm:del_channel:{ch['id']}"},
                 ]
             )
-        rows.append([{"text": "Add Channel", "callback_data": "adm:add_channel"}, {"text": "Back", "callback_data": "adm:home"}])
-        self.page(chat_id, "\n\n".join(lines), {"inline_keyboard": rows}, message_id)
+        rows.append([{"text": "➕ Add Channel", "callback_data": "adm:add_channel"}, {"text": "⬅️ Back", "callback_data": "adm:home"}])
+        self.page(chat_id, "\n\n".join(lines), {"inline_keyboard": rows}, message_id, parse_mode="HTML")
 
     def admin_settings(self, chat_id: int, message_id: int | None = None) -> None:
         s = self.store.settings_map()
@@ -2475,6 +2814,24 @@ class BotApp:
                 self.store.clear_state(admin_id)
                 self.api.send_message(chat_id, "Setting updated.", self.admin_keyboard())
 
+            elif state == "add_redeem":
+                lines = [line.strip() for line in text.splitlines() if line.strip()]
+                if len(lines) < 3:
+                    self.api.send_message(chat_id, "Send:\nCode\nValue\nMax users\n\nExample:\nFREE10\n10\n10")
+                    return
+                amount = parse_cents(lines[1], 0)
+                max_uses = int(lines[2]) if lines[2].isdigit() else 0
+                if not lines[0] or amount <= 0 or max_uses <= 0:
+                    self.api.send_message(chat_id, "Invalid redeem code, value or max users.")
+                    return
+                self.store.create_redeem_code(lines[0], amount, max_uses, admin_id)
+                self.store.clear_state(admin_id)
+                self.api.send_message(
+                    chat_id,
+                    f"Redeem code {lines[0].strip().upper()} added: {money(amount, self.currency())} x {max_uses} users.",
+                    self.admin_keyboard(),
+                )
+
             elif state == "dm_target":
                 if not text.lstrip("-").isdigit():
                     self.api.send_message(chat_id, "Send a numeric user ID.")
@@ -2534,9 +2891,17 @@ class BotApp:
             traceback.print_exc()
             self.api.send_message(chat_id, f"Error: {exc}\nUse /cancel and try again.")
 
-    def notify_admins(self, text: str) -> None:
+    def admin_user_link_keyboard(self, user_id: int) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "🔎 View Details", "callback_data": f"au:view:{user_id}"}],
+                [{"text": "📦 User Orders", "callback_data": f"au:orders:{user_id}"}],
+            ]
+        }
+
+    def notify_admins(self, text: str, reply_markup: dict[str, Any] | None = None) -> None:
         for admin_id in self.admins:
-            self.api.send_message(admin_id, text)
+            self.api.send_message(admin_id, text, reply_markup)
 
 
 def smoke_test() -> None:
@@ -2562,6 +2927,12 @@ def smoke_test() -> None:
     assert "KEY-001" in result["content"] and "KEY-002" in result["content"]
     store.adjust_balance(101, parse_cents("20"), "smoke")
     assert store.purchase(101, vid, quantity=2)["reason"] == "empty_stock"
+    store.create_redeem_code("FREE10", parse_cents("10"), 1, 999)
+    redeem = store.claim_redeem_code(101, "free10")
+    assert redeem["ok"], redeem
+    assert store.claim_redeem_code(101, "FREE10")["reason"] == "already_claimed"
+    store.upsert_user({"id": 103, "username": "late", "first_name": "Late"})
+    assert store.claim_redeem_code(103, "FREE10")["reason"] == "used_up"
     topup = store.create_topup(101, parse_cents("5"), "manual", "TXN")
     store.update_topup(topup, "approved")
     print("smoke-ok")
