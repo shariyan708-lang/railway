@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: telegram-selling-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python selling_bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: DATABASE_URL
+        sync: false

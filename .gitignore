@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+data/*.sqlite3
+*.log
+video-frames/
+video-frames2/
+video-contact.png
+video-thumb.png
