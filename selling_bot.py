@@ -20,6 +20,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "data" / "telegram_selling_bot.sqlite3"
 MAX_TEXT = 3900
+LINE = "━━━━━━━━━━━━━━━━━━━━"
 
 
 def load_env(path: Path) -> None:
@@ -59,6 +60,41 @@ def money(cents: int | None, currency: str) -> str:
     if code.upper() in {"USD", "USDT", "DOLLAR"} or code == "$":
         return f"${amount}"
     return f"{amount} {code}".strip()
+
+
+def html_escape(value: Any) -> str:
+    return (
+        str(value if value is not None else "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def html_code(value: Any) -> str:
+    return f"<code>{html_escape(value)}</code>"
+
+
+def html_bold(value: Any) -> str:
+    return f"<b>{html_escape(value)}</b>"
+
+
+def normalize_chat_id(link: str, chat_id: str) -> str:
+    raw = (chat_id or "").strip()
+    source = raw or (link or "").strip()
+    if source.startswith("https://t.me/"):
+        slug = source.removeprefix("https://t.me/").split("?", 1)[0].strip("/")
+        if slug and not slug.startswith(("+", "joinchat/")):
+            return f"@{slug}"
+    if source.startswith("http://t.me/"):
+        slug = source.removeprefix("http://t.me/").split("?", 1)[0].strip("/")
+        if slug and not slug.startswith(("+", "joinchat/")):
+            return f"@{slug}"
+    if source.startswith("t.me/"):
+        slug = source.removeprefix("t.me/").split("?", 1)[0].strip("/")
+        if slug and not slug.startswith(("+", "joinchat/")):
+            return f"@{slug}"
+    return raw
 
 
 def chunk_text(text: str, limit: int = MAX_TEXT) -> list[str]:
@@ -441,7 +477,7 @@ class Store:
             "currency": "USD",
             "join_required": "1",
             "welcome_text": "Welcome. Use the buttons below.",
-            "join_text": "ACCESS DENIED!\n\nYou must join our channels to unlock the bot features.",
+            "join_text": "⚠️ ACCESS DENIED!\n\nYou must join our channels to unlock the bot features.",
             "verify_failed_text": "Please join all required channels, then tap Verify again.",
             "help_text": "Need help? Contact support.",
             "contact_text": "Support: @your_support_username",
@@ -449,13 +485,13 @@ class Store:
             "low_balance_text": "Insufficient balance. Please top up and try again.",
             "empty_stock_text": "This variant is out of stock.",
             "banned_text": "Your account is banned. Contact support.",
-            "order_success_text": "Purchase successful. Your item is delivered below.",
+            "order_success_text": "PURCHASE SUCCESSFUL!",
             "bot_username": os.getenv("BOT_USERNAME", ""),
             "referral_enabled": "1",
             "referral_reward": "0.01",
             "owner_url": "https://t.me/your_support_username",
             "channel_url": "https://t.me/your_channel",
-            "info_text": "HOW IT WORKS\n\nStep 1: Earn balance by inviting friends.\nStep 2: Visit the shop to buy your keys.\nStep 3: Use your balance to purchase products.\n\nServer Status: Operational",
+            "info_text": "HOW IT WORKS\n\nStep 1: Earn balance by inviting friends.\nStep 2: Visit the Shop to buy your keys.\nStep 3: Use Gifts to transfer money.\n\nNeed help? Join our community or contact support.\n\nServer Status: Operational",
             "redeem_text": "Redeem is available through support. Contact owner for redeem code help.",
         }
         for key, value in defaults.items():
@@ -639,9 +675,10 @@ class Store:
         return list(rows)
 
     def add_channel(self, title: str, link: str, chat_id: str) -> None:
+        cleaned_chat_id = normalize_chat_id(link, chat_id)
         self.execute(
             "INSERT INTO channels(title, link, chat_id, enabled, sort_order, created_at) VALUES(?, ?, ?, 1, 0, ?)",
-            (title.strip(), link.strip(), chat_id.strip(), now_iso()),
+            (title.strip(), link.strip(), cleaned_chat_id, now_iso()),
         )
         self.invalidate_channels_cache()
 
@@ -854,8 +891,9 @@ class Store:
             (user_id, variant_id, price_cents, stamp, stamp),
         )
 
-    def purchase(self, user_id: int, variant_id: int) -> dict[str, Any]:
+    def purchase(self, user_id: int, variant_id: int, quantity: int = 1) -> dict[str, Any]:
         stamp = now_iso()
+        quantity = max(1, min(int(quantity or 1), 50))
         with self.lock:
             self.begin()
             try:
@@ -885,34 +923,49 @@ class Store:
                     self.q("SELECT price_cents FROM user_variant_prices WHERE user_id = ? AND variant_id = ?"),
                     (user_id, variant_id),
                 ).fetchone()
-                price = int(custom["price_cents"]) if custom else int(variant["price_cents"])
-                if int(user["balance_cents"]) < price:
+                unit_price = int(custom["price_cents"]) if custom else int(variant["price_cents"])
+                total_price = unit_price * quantity
+                if int(user["balance_cents"]) < total_price:
                     self.rollback()
-                    return {"ok": False, "reason": "low_balance", "price_cents": price}
+                    return {
+                        "ok": False,
+                        "reason": "low_balance",
+                        "price_cents": total_price,
+                        "unit_price_cents": unit_price,
+                        "quantity": quantity,
+                    }
 
-                stock = self.conn.execute(
+                stock_rows = self.conn.execute(
                     self.q(
                         """
                         SELECT * FROM stock_items
                         WHERE variant_id = ? AND status = 'available'
                         ORDER BY id ASC
-                        LIMIT 1
+                        LIMIT ?
                         """
                     ),
-                    (variant_id,),
-                ).fetchone()
-                if not stock:
+                    (variant_id, quantity),
+                ).fetchall()
+                if len(stock_rows) < quantity:
                     self.rollback()
-                    return {"ok": False, "reason": "empty_stock"}
+                    return {
+                        "ok": False,
+                        "reason": "empty_stock",
+                        "available": len(stock_rows),
+                        "quantity": quantity,
+                    }
 
                 self.conn.execute(
                     self.q("UPDATE users SET balance_cents = balance_cents - ?, updated_at = ? WHERE user_id = ?"),
-                    (price, stamp, user_id),
+                    (total_price, stamp, user_id),
                 )
-                self.conn.execute(
-                    self.q("UPDATE stock_items SET status = 'sold', sold_to = ?, sold_at = ? WHERE id = ?"),
-                    (user_id, stamp, stock["id"]),
-                )
+                for stock in stock_rows:
+                    self.conn.execute(
+                        self.q("UPDATE stock_items SET status = 'sold', sold_to = ?, sold_at = ? WHERE id = ?"),
+                        (user_id, stamp, stock["id"]),
+                    )
+                delivered_content = "\n".join(str(stock["content"]) for stock in stock_rows)
+                first_stock_id = int(stock_rows[0]["id"])
                 if self.is_pg:
                     order = self.conn.execute(
                         self.q(
@@ -925,9 +978,9 @@ class Store:
                             user_id,
                             variant["product_id"],
                             variant_id,
-                            stock["id"],
-                            price,
-                            stock["content"],
+                            first_stock_id,
+                            total_price,
+                            delivered_content,
                             stamp,
                         ),
                     ).fetchone()
@@ -944,9 +997,9 @@ class Store:
                             user_id,
                             variant["product_id"],
                             variant_id,
-                            stock["id"],
-                            price,
-                            stock["content"],
+                            first_stock_id,
+                            total_price,
+                            delivered_content,
                             stamp,
                         ),
                     )
@@ -956,8 +1009,11 @@ class Store:
                     "ok": True,
                     "order_id": order_id,
                     "variant": variant,
-                    "price_cents": price,
-                    "content": stock["content"],
+                    "unit_price_cents": unit_price,
+                    "price_cents": total_price,
+                    "quantity": quantity,
+                    "new_balance_cents": int(user["balance_cents"]) - total_price,
+                    "content": delivered_content,
                 }
             except Exception:
                 self.rollback()
@@ -1110,6 +1166,7 @@ class TelegramAPI:
         chat_id: int | str,
         text: str,
         reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = None,
     ) -> dict[str, Any]:
         last: dict[str, Any] = {"ok": True}
         parts = chunk_text(text)
@@ -1121,6 +1178,8 @@ class TelegramAPI:
             }
             if reply_markup and index == len(parts) - 1:
                 payload["reply_markup"] = reply_markup
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
             last = self.request("sendMessage", payload)
         return last
 
@@ -1130,6 +1189,7 @@ class TelegramAPI:
         message_id: int,
         text: str,
         reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
@@ -1139,6 +1199,8 @@ class TelegramAPI:
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         return self.request("editMessageText", payload)
 
     def answer_callback(self, callback_id: str, text: str = "", alert: bool = False) -> dict[str, Any]:
@@ -1206,12 +1268,13 @@ class BotApp:
         text: str,
         reply_markup: dict[str, Any] | None = None,
         message_id: int | None = None,
+        parse_mode: str | None = None,
     ) -> None:
         if message_id:
-            response = self.api.edit_message(chat_id, message_id, text, reply_markup)
+            response = self.api.edit_message(chat_id, message_id, text, reply_markup, parse_mode=parse_mode)
             if response.get("ok"):
                 return
-        self.api.send_message(chat_id, text, reply_markup)
+        self.api.send_message(chat_id, text, reply_markup, parse_mode=parse_mode)
 
     def contact_admin_keyboard(self) -> dict[str, Any]:
         owner_url = self.store.setting("owner_url", "").strip()
@@ -1262,6 +1325,10 @@ class BotApp:
             self.store.clear_state(user_id)
             self.api.send_message(chat_id, "Canceled.", self.admin_keyboard())
             return
+        if text == "/cancel":
+            self.store.clear_state(user_id)
+            self.api.send_message(chat_id, "Canceled.", self.reply_keyboard())
+            return
 
         if self.is_admin(user_id):
             state = self.store.get_state(user_id)
@@ -1286,6 +1353,10 @@ class BotApp:
         command = text.split(maxsplit=1)[0].lower() if text else ""
         if command not in {"/start", "/menu"} and not self.join_ok(user_id):
             self.show_join_gate(chat_id)
+            return
+        state = self.store.get_state(user_id)
+        if state and state[0] == "custom_quantity" and not text.startswith("/"):
+            self.handle_custom_quantity(chat_id, user_id, text, state[1])
             return
         button = text.lower()
         if command in {"/start", "/menu"}:
@@ -1324,7 +1395,8 @@ class BotApp:
         message_id = int(query["message"]["message_id"])
         data = query.get("data") or ""
         user = self.store.upsert_user(query["from"])
-        self.api.answer_callback(query["id"])
+        if data != "verify":
+            self.api.answer_callback(query["id"])
 
         if data.startswith("adm:") or data.startswith("ap:") or data.startswith("av:") or data.startswith("au:") or data.startswith("at:"):
             if not self.is_admin(user_id):
@@ -1343,10 +1415,16 @@ class BotApp:
             return
 
         if data == "verify":
-            if self.join_ok(user_id):
-                self.api.edit_message(chat_id, message_id, self.store.setting("welcome_text"), self.user_keyboard())
+            ok, missing = self.join_status(user_id, use_cache=False)
+            if ok:
+                self.join_success_cache[user_id] = time.monotonic() + self.join_cache_seconds
+                self.api.answer_callback(query["id"], "Verification successful.")
+                self.api.send_message(chat_id, self.verification_success_text(user), self.reply_keyboard())
             else:
-                self.api.answer_callback(query["id"], self.store.setting("verify_failed_text"), alert=True)
+                detail = ""
+                if missing:
+                    detail = "\n\nMissing: " + ", ".join(missing[:5])
+                self.api.answer_callback(query["id"], self.store.setting("verify_failed_text") + detail, alert=True)
             return
 
         if not self.join_ok(user_id):
@@ -1360,9 +1438,21 @@ class BotApp:
         elif data.startswith("u:p:"):
             self.show_product_variants(chat_id, user_id, int(data.rsplit(":", 1)[1]), message_id=message_id)
         elif data.startswith("u:v:"):
-            self.show_variant(chat_id, user_id, int(data.rsplit(":", 1)[1]), message_id=message_id)
+            self.show_quantity(chat_id, user_id, int(data.rsplit(":", 1)[1]), message_id=message_id)
+        elif data.startswith("u:q:"):
+            self.show_quantity(chat_id, user_id, int(data.rsplit(":", 1)[1]), message_id=message_id)
+        elif data.startswith("u:qty:"):
+            _, _, raw_variant, raw_qty = data.split(":", 3)
+            self.show_confirm_purchase(chat_id, user_id, int(raw_variant), int(raw_qty), message_id=message_id)
+        elif data.startswith("u:qcustom:"):
+            variant_id = int(data.rsplit(":", 1)[1])
+            self.store.set_state(user_id, "custom_quantity", {"variant_id": variant_id})
+            self.api.send_message(chat_id, "✏️ Send quantity number.\nExample: 5\n\n/cancel to stop.", self.user_keyboard())
+        elif data.startswith("u:confirm:"):
+            _, _, raw_variant, raw_qty = data.split(":", 3)
+            self.buy(chat_id, user_id, int(raw_variant), int(raw_qty), message_id=message_id)
         elif data.startswith("u:buy:"):
-            self.buy(chat_id, user_id, int(data.rsplit(":", 1)[1]), message_id=message_id)
+            self.show_confirm_purchase(chat_id, user_id, int(data.rsplit(":", 1)[1]), 1, message_id=message_id)
         elif data == "u:invite":
             self.show_invite_friends(chat_id, user_id, message_id=message_id)
         elif data == "u:invite_copy":
@@ -1407,32 +1497,62 @@ class BotApp:
     def join_keyboard(self) -> dict[str, Any]:
         rows = []
         for i, channel in enumerate(self.store.channels(enabled_only=True), start=1):
-            rows.append([{"text": f"JOIN CHANNEL {i}", "url": channel["link"]}])
-        rows.append([{"text": "VERIFY", "callback_data": "verify"}])
+            rows.append([{"text": f"📣 JOIN CHANNEL {i}", "url": channel["link"]}])
+        rows.append([{"text": "✅ VERIFY", "callback_data": "verify"}])
         return {"inline_keyboard": rows}
 
-    def join_ok(self, user_id: int) -> bool:
+    def join_status(self, user_id: int, use_cache: bool = True) -> tuple[bool, list[str]]:
         if self.store.setting("join_required", "1") != "1":
-            return True
+            return True, []
         cached_until = self.join_success_cache.get(user_id, 0)
-        if cached_until > time.monotonic():
-            return True
+        if use_cache and cached_until > time.monotonic():
+            return True, []
         channels = self.store.channels(enabled_only=True)
-        verifiable = [channel for channel in channels if (channel["chat_id"] or "").strip()]
-        if not verifiable:
-            return True
+        if not channels:
+            return True, []
         valid = {"creator", "administrator", "member"}
-        for channel in verifiable:
-            response = self.api.get_chat_member(str(channel["chat_id"]).strip(), user_id)
+        missing: list[str] = []
+        for index, channel in enumerate(channels, start=1):
+            title = str(channel["title"] or f"Channel {index}")
+            chat_id = normalize_chat_id(str(channel["link"] or ""), str(channel["chat_id"] or ""))
+            if not chat_id:
+                missing.append(title)
+                continue
+            response = self.api.get_chat_member(chat_id, user_id)
             if not response.get("ok"):
-                return False
-            if response.get("result", {}).get("status") not in valid:
-                return False
+                missing.append(title)
+                continue
+            result = response.get("result", {})
+            status = result.get("status")
+            is_restricted_member = status == "restricted" and bool(result.get("is_member"))
+            if status not in valid and not is_restricted_member:
+                missing.append(title)
+        if missing:
+            self.join_success_cache.pop(user_id, None)
+            return False, missing
         self.join_success_cache[user_id] = time.monotonic() + self.join_cache_seconds
-        return True
+        return True, []
+
+    def join_ok(self, user_id: int) -> bool:
+        ok, _ = self.join_status(user_id)
+        return ok
 
     def show_join_gate(self, chat_id: int) -> None:
-        self.api.send_message(chat_id, self.store.setting("join_text"), self.join_keyboard())
+        text = self.store.setting("join_text").strip()
+        if text == "ACCESS DENIED!\n\nYou must join our channels to unlock the bot features.":
+            text = "⚠️ ACCESS DENIED!\n\nYou must join our channels to unlock the bot features."
+        self.api.send_message(chat_id, text, self.join_keyboard())
+
+    def verification_success_text(self, user: Any) -> str:
+        name = str(user["first_name"] if user and user["first_name"] else "friend").strip()
+        return (
+            "✅ VERIFICATION SUCCESSFUL\n\n"
+            f"Welcome back, {name}!\n\n"
+            "🔷 Status: 🟢 Active Account\n"
+            "🔷 Access: 🛡 Full Access Granted\n\n"
+            "✨ Your menu has been unlocked. You can now use the bot freely.\n\n"
+            f"Enjoy your experience with {self.store.setting('bot_name', 'our bot')}! 💎"
+        )
 
     def show_user_home(self, chat_id: int, user: Any, message_id: int | None = None) -> None:
         if not self.join_ok(int(user["user_id"])):
@@ -1474,7 +1594,7 @@ class BotApp:
             f"✅ Status: Payouts {active}\n"
             f"👥 Friends invited: {referral_count}\n\n"
             "📍 Your unique link:\n"
-            f"{link}\n\n"
+            f"{html_code(link)}\n\n"
             "📋 Tap COPY LINK to receive the link alone, then tap and hold it to copy.\n\n"
             "📣 Start sharing now and get your keys for free."
         )
@@ -1491,36 +1611,37 @@ class BotApp:
                 [{"text": "⬅️ Back", "callback_data": "u:home"}],
             ]
         }
-        self.page(chat_id, text, keyboard, message_id)
+        self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
 
     def send_referral_copy(self, chat_id: int, user_id: int) -> None:
         link = self.referral_link(user_id)
         if not link:
             self.api.send_message(chat_id, "Referral link is not configured yet.", self.user_keyboard())
             return
-        self.api.send_message(chat_id, f"📋 Tap and hold to copy:\n\n{link}", self.user_keyboard())
+        self.api.send_message(chat_id, f"📋 Tap and hold to copy:\n\n{html_code(link)}", self.user_keyboard(), parse_mode="HTML")
 
     def show_profile(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
         user = self.store.user(user_id)
         orders = self.store.orders(limit=5, user_id=user_id)
         username = f"@{user['username']}" if user and user["username"] else "-"
         lines = [
-            "💳 PROFILE",
+            "💳 <b>MY PROFILE</b>",
+            LINE,
             "",
-            f"👤 Name: {user['first_name'] if user else '-'} {user['last_name'] if user and user['last_name'] else ''}".strip(),
-            f"🆔 User ID: {user_id}",
-            f"👤 Username: {username}",
-            f"📅 Member Since: {user['created_at'][:10] if user else '-'}",
+            f"👤 Name: {html_escape((user['first_name'] if user else '-') + (' ' + user['last_name'] if user and user['last_name'] else ''))}",
+            f"🆔 User ID: {html_code(user_id)}",
+            f"👤 Username: {html_code(username)}",
+            f"📅 Member Since: {html_code(user['created_at'][:10] if user else '-')}",
             "",
-            f"💰 Wallet: {money(int(user['balance_cents']) if user else 0, self.currency())}",
-            f"👥 Invites: {self.store.referral_count(user_id)}",
-            f"🛒 Orders: {len(orders)} latest shown",
+            f"💰 Wallet: {html_bold(money(int(user['balance_cents']) if user else 0, self.currency()))}",
+            f"👥 Invites: {html_bold(self.store.referral_count(user_id))}",
+            f"🛒 Orders: {html_bold(len(orders))} latest shown",
         ]
         for order in orders:
             lines.append(
-                f"#{order['id']} {order['product_emoji'] or '📦'} {order['product_title']} / {order['variant_title']} - {money(order['price_cents'], self.currency())}"
+                f"#{order['id']} {order['product_emoji'] or '📦'} {html_escape(order['product_title'])} / {html_escape(order['variant_title'])} - {html_bold(money(order['price_cents'], self.currency()))}"
             )
-        self.page(chat_id, "\n".join(lines), self.user_keyboard(), message_id)
+        self.page(chat_id, "\n".join(lines), self.user_keyboard(), message_id, parse_mode="HTML")
 
     def show_info_bot(self, chat_id: int, message_id: int | None = None) -> None:
         owner_url = self.store.setting("owner_url", "").strip()
@@ -1535,7 +1656,19 @@ class BotApp:
             rows.append(buttons)
         rows.append([{"text": "👥 Invite Friends", "callback_data": "u:invite"}])
         rows.append([{"text": "⬅️ Back", "callback_data": "u:home"}])
-        self.page(chat_id, f"ℹ️ INFO BOT\n\n{self.store.setting('info_text')}", {"inline_keyboard": rows}, message_id)
+        info_text = self.store.setting("info_text", "").strip()
+        if not info_text or info_text.upper().startswith("HOW IT WORKS"):
+            text = (
+                "🛠 <b>HOW IT WORKS</b>\n\n"
+                "⚡ <b>Step 1:</b> Earn balance by inviting friends.\n"
+                "🛒 <b>Step 2:</b> Visit the Shop to buy your keys.\n"
+                "🎁 <b>Step 3:</b> Use Gifts to transfer money.\n\n"
+                "📢 <b>Need help?</b> Join our community or contact support.\n\n"
+                "🛡 <b>Server Status:</b> <code>Operational</code> ✅"
+            )
+        else:
+            text = f"ℹ️ <b>INFO BOT</b>\n\n{html_escape(info_text)}"
+        self.page(chat_id, text, {"inline_keyboard": rows}, message_id, parse_mode="HTML")
 
     def show_products(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
         products = self.store.products(active_only=True)
@@ -1556,76 +1689,214 @@ class BotApp:
             self.page(chat_id, "No variants are available for this product.", self.user_keyboard(), message_id)
             return
         rows = []
+        user = self.store.user(user_id)
+        balance = int(user["balance_cents"]) if user else 0
         custom_prices = self.store.custom_price_map(user_id, [int(v["id"]) for v in variants])
+        lines = [
+            f"{product['emoji'] or '📦'} <b>{html_escape(product['title'])}</b>",
+        ]
+        if product["description"]:
+            lines.append(f"📝 {html_escape(product['description'])}")
+        lines.extend(
+            [
+                "",
+                f"💰 Your Balance: {html_bold(money(balance, self.currency()))}",
+                "",
+                LINE,
+                "🛒 <b>Available Options:</b>",
+                "",
+            ]
+        )
         for v in variants:
             price = custom_prices.get(int(v["id"]), int(v["price_cents"]))
+            duration = self.duration_label(int(v["days"]))
+            lines.append(
+                f"✅ <b>{html_escape(duration)}</b>\n"
+                f"┣ 💵 Price: {html_bold(money(price, self.currency()))}\n"
+                f"┗ 📦 Stock: {html_bold(str(v['stock_count']))} available\n"
+            )
             rows.append(
                 [
                     {
-                        "text": f"⏳ {v['title']} - {money(price, self.currency())} - 🔑 {v['stock_count']}",
+                        "text": f"🛒 Buy {duration} - {money(price, self.currency())}",
                         "callback_data": f"u:v:{v['id']}",
                     }
                 ]
             )
         rows.append([{"text": "⬅️ Back to Products", "callback_data": "u:products"}])
-        text = f"{product['emoji'] or '📦'} {product['title']}\n\n{product['description'] or ''}\n\n⏳ Choose duration/variant:"
-        self.page(chat_id, text, {"inline_keyboard": rows}, message_id)
+        lines.extend([LINE, "<i>Select an option to purchase</i>"])
+        self.page(chat_id, "\n".join(lines), {"inline_keyboard": rows}, message_id, parse_mode="HTML")
 
     def show_variant(self, chat_id: int, user_id: int, variant_id: int, message_id: int | None = None) -> None:
+        self.show_quantity(chat_id, user_id, variant_id, message_id)
+
+    def duration_label(self, days: int) -> str:
+        return f"{int(days)} Days"
+
+    def show_quantity(self, chat_id: int, user_id: int, variant_id: int, message_id: int | None = None) -> None:
         variant = self.store.variant(variant_id)
         if not variant or not int(variant["active"]):
             self.page(chat_id, "Variant not found.", self.user_keyboard(), message_id)
             return
         price = self.store.effective_price(user_id, variant_id, int(variant["price_cents"]))
+        user = self.store.user(user_id)
+        balance = int(user["balance_cents"]) if user else 0
+        stock_count = int(variant["stock_count"])
+        duration = self.duration_label(int(variant["days"]))
         text = (
-            f"{variant['product_emoji'] or '📦'} Product: {variant['product_title']}\n"
-            f"⏳ Variant: {variant['title']}\n"
-            f"📅 Days: {variant['days']}\n"
-            f"💰 Price: {money(price, self.currency())}\n"
-            f"🔑 Stock: {variant['stock_count']}"
+            "🛒 <b>SELECT QUANTITY</b>\n"
+            f"{LINE}\n\n"
+            "📦 <b>Product Details</b>\n"
+            f"┣ {variant['product_emoji'] or '📦'} {html_bold(variant['product_title'])}\n"
+            f"┣ ⏱ Duration: {html_bold(duration)}\n"
+            f"┣ 💵 Unit Price: {html_bold(money(price, self.currency()))}\n"
+            f"┗ 📦 Available: {html_bold(str(stock_count))} keys\n\n"
+            "💳 <b>Your Account</b>\n"
+            f"┗ 💰 Balance: {html_bold(money(balance, self.currency()))}\n\n"
+            f"{LINE}\n"
+            "<i>Select quantity to purchase:</i>"
+        )
+        quantity_buttons = []
+        for qty in (1, 2, 3):
+            if stock_count >= qty:
+                quantity_buttons.append(
+                    {"text": f"🛒 {qty}x = {money(price * qty, self.currency())}", "callback_data": f"u:qty:{variant_id}:{qty}"}
+                )
+        rows = []
+        if quantity_buttons[:2]:
+            rows.append(quantity_buttons[:2])
+        if len(quantity_buttons) >= 3:
+            rows.append([quantity_buttons[2]])
+        rows.append([{"text": "✏️ Custom Quantity", "callback_data": f"u:qcustom:{variant_id}"}])
+        rows.append([{"text": "⬅️ Back", "callback_data": f"u:p:{variant['product_id']}"}])
+        self.page(chat_id, text, {"inline_keyboard": rows}, message_id, parse_mode="HTML")
+
+    def handle_custom_quantity(self, chat_id: int, user_id: int, text: str, data: dict[str, Any]) -> None:
+        if not text.isdigit():
+            self.api.send_message(chat_id, "Send a valid quantity number.\nExample: 5\n\n/cancel to stop.")
+            return
+        quantity = int(text)
+        if quantity <= 0 or quantity > 50:
+            self.api.send_message(chat_id, "Quantity must be between 1 and 50.\n/cancel to stop.")
+            return
+        self.store.clear_state(user_id)
+        self.show_confirm_purchase(chat_id, user_id, int(data["variant_id"]), quantity)
+
+    def show_confirm_purchase(
+        self,
+        chat_id: int,
+        user_id: int,
+        variant_id: int,
+        quantity: int,
+        message_id: int | None = None,
+    ) -> None:
+        quantity = max(1, min(int(quantity or 1), 50))
+        variant = self.store.variant(variant_id)
+        if not variant or not int(variant["active"]):
+            self.page(chat_id, "Variant not found.", self.user_keyboard(), message_id)
+            return
+        unit_price = self.store.effective_price(user_id, variant_id, int(variant["price_cents"]))
+        total = unit_price * quantity
+        user = self.store.user(user_id)
+        balance = int(user["balance_cents"]) if user else 0
+        stock_count = int(variant["stock_count"])
+        duration = self.duration_label(int(variant["days"]))
+        if stock_count < quantity:
+            text = (
+                "📦 <b>NOT ENOUGH STOCK</b>\n\n"
+                f"Available keys: {html_bold(stock_count)}\n"
+                f"Requested quantity: {html_bold(quantity)}"
+            )
+            self.page(chat_id, text, {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": f"u:q:{variant_id}"}]]}, message_id, parse_mode="HTML")
+            return
+        if balance < total:
+            text = (
+                "💰 <b>INSUFFICIENT BALANCE</b>\n\n"
+                f"Required: {html_bold(money(total, self.currency()))}\n"
+                f"Your balance: {html_bold(money(balance, self.currency()))}\n\n"
+                "Please contact admin to add balance."
+            )
+            self.page(chat_id, text, self.contact_admin_keyboard(), message_id, parse_mode="HTML")
+            return
+        after_balance = balance - total
+        text = (
+            "✅ <b>CONFIRM PURCHASE</b>\n"
+            f"{LINE}\n\n"
+            "📦 <b>Order Summary</b>\n"
+            f"┣ {variant['product_emoji'] or '📦'} {html_bold(variant['product_title'])}\n"
+            f"┣ ⏱ Duration: {html_bold(duration)}\n"
+            f"┣ 📦 Quantity: {html_bold(quantity)}\n"
+            f"┗ 💵 Total: {html_bold(money(total, self.currency()))}\n\n"
+            "💳 <b>Payment Details</b>\n"
+            f"┣ 💰 Your Balance: {html_bold(money(balance, self.currency()))}\n"
+            f"┗ 💳 After Purchase: {html_bold(money(after_balance, self.currency()))}\n\n"
+            f"{LINE}\n"
+            "⚠️ <i>Please review your order carefully.\nClick confirm to complete purchase!</i>"
         )
         keyboard = {
             "inline_keyboard": [
-                [{"text": "🛒 Buy Now", "callback_data": f"u:buy:{variant_id}"}],
-                [{"text": "⬅️ Back", "callback_data": f"u:p:{variant['product_id']}"}],
+                [{"text": "✅ Confirm Purchase", "callback_data": f"u:confirm:{variant_id}:{quantity}"}],
+                [{"text": "❌ Cancel", "callback_data": f"u:q:{variant_id}"}],
             ]
         }
-        self.page(chat_id, text, keyboard, message_id)
+        self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
 
-    def buy(self, chat_id: int, user_id: int, variant_id: int, message_id: int | None = None) -> None:
-        result = self.store.purchase(user_id, variant_id)
+    def buy(self, chat_id: int, user_id: int, variant_id: int, quantity: int = 1, message_id: int | None = None) -> None:
+        result = self.store.purchase(user_id, variant_id, quantity=quantity)
         if not result.get("ok"):
             reason = result.get("reason")
             if reason == "low_balance":
                 text = (
-                    "💰 INSUFFICIENT BALANCE\n\n"
-                    f"{self.store.setting('low_balance_text')}\n\n"
+                    "💰 <b>INSUFFICIENT BALANCE</b>\n\n"
+                    f"{html_escape(self.store.setting('low_balance_text'))}\n\n"
                     "Please contact admin to add balance."
                 )
-                self.page(chat_id, text, self.contact_admin_keyboard(), message_id)
+                self.page(chat_id, text, self.contact_admin_keyboard(), message_id, parse_mode="HTML")
             elif reason == "empty_stock":
-                self.page(chat_id, self.store.setting("empty_stock_text"), self.user_keyboard(), message_id)
+                available = result.get("available")
+                text = f"📦 <b>OUT OF STOCK</b>\n\n{html_escape(self.store.setting('empty_stock_text'))}"
+                if available is not None:
+                    text += f"\nAvailable now: {html_bold(available)}"
+                self.page(chat_id, text, self.user_keyboard(), message_id, parse_mode="HTML")
             else:
                 self.page(chat_id, "Purchase failed. Contact support.", self.contact_admin_keyboard(), message_id)
             return
         variant = result["variant"]
+        duration = self.duration_label(int(variant["days"]))
+        content = str(result["content"])
         text = (
-            f"✅ {self.store.setting('order_success_text')}\n\n"
-            f"🧾 Order ID: {result['order_id']}\n"
-            f"{variant['product_emoji'] or '📦'} Product: {variant['product_title']}\n"
-            f"⏳ Variant: {variant['title']} ({variant['days']} days)\n"
-            f"💰 Price: {money(result['price_cents'], self.currency())}\n\n"
-            f"{result['content']}"
+            f"🎉 <b>{html_escape(self.store.setting('order_success_text', 'PURCHASE SUCCESSFUL!'))}</b>\n"
+            f"{LINE}\n\n"
+            "📦 <b>Order Details</b>\n"
+            f"┣ {variant['product_emoji'] or '📦'} {html_bold(variant['product_title'])}\n"
+            f"┣ ⏱ Duration: {html_bold(duration)}\n"
+            f"┣ 📦 Quantity: {html_bold(result.get('quantity', quantity))}\n"
+            f"┗ 💵 Total Paid: {html_bold(money(result['price_cents'], self.currency()))}\n\n"
+            "💳 <b>Payment</b>\n"
+            f"┗ 💰 New Balance: {html_bold(money(result.get('new_balance_cents', 0), self.currency()))}\n\n"
+            f"{LINE}\n"
+            "🔑 <b>Your License Key(s):</b>\n\n"
+            f"{html_code(content)}\n\n"
+            f"{LINE}\n"
+            "💡 <i>Tap the keys above to copy all!</i>\n"
+            "✅ <i>Thank you for your purchase!</i>"
         )
-        self.page(chat_id, text, self.user_keyboard(), message_id)
-        self.api.send_message(chat_id, f"📋 Tap and hold to copy your key:\n\n{result['content']}")
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "🛒 Shop More", "callback_data": "u:products"}],
+                [{"text": "📦 My Orders", "callback_data": "u:orders"}],
+                [{"text": "⬅️ Back", "callback_data": "u:home"}],
+            ]
+        }
+        self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
         self.notify_admins(
             "🛒 New order\n"
             f"🧾 Order ID: {result['order_id']}\n"
             f"👤 User ID: {user_id}\n"
             f"{variant['product_emoji'] or '📦'} Product: {variant['product_title']}\n"
-            f"⏳ Variant: {variant['title']} ({variant['days']} days)\n"
-            f"💰 Price: {money(result['price_cents'], self.currency())}"
+            f"⏳ Duration: {duration}\n"
+            f"📦 Quantity: {result.get('quantity', quantity)}\n"
+            f"💰 Total: {money(result['price_cents'], self.currency())}"
         )
 
     def show_balance(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
@@ -1685,6 +1956,36 @@ class BotApp:
             "is_persistent": True,
         }
 
+    def admin_menu_guide(self) -> str:
+        return (
+            "🧭 MENU GUIDE\n"
+            "┣ 📦 Products: product, variant, emoji and stock manage\n"
+            "┣ 👥 Users: customer list, ban/unban, direct message\n"
+            "┣ 💰 Balance: who has balance and add/deduct balance\n"
+            "┣ 💎 Custom Pricing: open a user, then set variant custom price\n"
+            "┣ 📣 Broadcast: send one message to every active user\n"
+            "┣ 💭 Channels: forced join channel links and verify chat IDs\n"
+            "┗ ⚙️ Settings: owner/channel/info/help/payment texts\n"
+        )
+
+    def setting_help(self, key: str) -> str:
+        helps = {
+            "bot_name": "Bot display name shown in welcome and info screens.",
+            "currency": "Currency code. Use USD or $ to show dollar symbol.",
+            "bot_username": "Bot username without @. This creates referral links.",
+            "referral_reward": "Balance reward per new invited user. Example: 0.01",
+            "owner_url": "Owner/support Telegram link. Example: https://t.me/username",
+            "channel_url": "Main channel/community link shown in Info Bot.",
+            "welcome_text": "Text shown after /start when user has access.",
+            "join_text": "Access denied text shown before forced join verification.",
+            "help_text": "Help text sent from /help.",
+            "contact_text": "Support/contact text sent from /contact.",
+            "info_text": "Info Bot body text. Default layout becomes HOW IT WORKS.",
+            "redeem_text": "Text shown when user taps Redeem.",
+            "payment_methods": "Manual top-up payment instruction.",
+        }
+        return helps.get(key, "Send the new value for this setting.")
+
     def show_admin_home(self, chat_id: int, message_id: int | None = None) -> None:
         s = self.store.stats()
         text = (
@@ -1702,6 +2003,7 @@ class BotApp:
             f"┗ 💵 Sales: {money(s['today_sales'], self.currency())}\n\n"
             f"⏳ Pending Top-ups: {s['topups']}\n"
             f"🚫 Banned Users: {s['banned']}\n\n"
+            f"{self.admin_menu_guide()}\n"
             "🎲 Select a menu below:"
         )
         self.page(chat_id, text, self.admin_keyboard(), message_id)
@@ -1718,13 +2020,13 @@ class BotApp:
         elif data.startswith("ap:"):
             self.handle_product_admin(chat_id, admin_id, data, message_id)
         elif data.startswith("av:"):
-            self.handle_variant_admin(chat_id, admin_id, data)
+            self.handle_variant_admin(chat_id, admin_id, data, message_id)
         elif data.startswith("adm:users:"):
             self.admin_users(chat_id, int(data.rsplit(":", 1)[1]), balance_only=False, message_id=message_id)
         elif data.startswith("adm:balances:"):
             self.admin_users(chat_id, int(data.rsplit(":", 1)[1]), balance_only=True, message_id=message_id)
         elif data.startswith("au:"):
-            self.handle_user_admin(chat_id, admin_id, data)
+            self.handle_user_admin(chat_id, admin_id, data, message_id)
         elif data == "adm:broadcast":
             self.store.set_state(admin_id, "broadcast")
             self.api.send_message(chat_id, "Send the message/media to broadcast to all users.\n/cancel to stop.")
@@ -1732,22 +2034,34 @@ class BotApp:
             self.store.set_state(admin_id, "dm_target")
             self.api.send_message(chat_id, "Send target user ID.\n/cancel to stop.")
         elif data == "adm:channels":
-            self.admin_channels(chat_id)
+            self.admin_channels(chat_id, message_id=message_id)
         elif data == "adm:add_channel":
             self.store.set_state(admin_id, "add_channel")
-            self.api.send_message(chat_id, "Send channel info:\nTitle\nJoin link\nChat ID or @username\n\n/cancel to stop.")
+            self.api.send_message(
+                chat_id,
+                "💭 Add forced-join channel\n\n"
+                "Send channel info:\n"
+                "Title\n"
+                "Join link\n"
+                "Chat ID or @username\n\n"
+                "Example:\n"
+                "Channel 1\n"
+                "https://t.me/yourchannel\n"
+                "@yourchannel\n\n"
+                "Bot must be admin/member in that channel for Verify to work.\n/cancel to stop.",
+            )
         elif data.startswith("adm:del_channel:"):
             self.store.delete_channel(int(data.rsplit(":", 1)[1]))
-            self.admin_channels(chat_id)
+            self.admin_channels(chat_id, message_id=message_id)
         elif data.startswith("adm:toggle_channel:"):
             self.store.toggle_channel(int(data.rsplit(":", 1)[1]))
-            self.admin_channels(chat_id)
+            self.admin_channels(chat_id, message_id=message_id)
         elif data == "adm:settings":
             self.admin_settings(chat_id, message_id=message_id)
         elif data.startswith("adm:set:"):
             key = data.split(":", 2)[2]
             self.store.set_state(admin_id, "set_setting", {"key": key})
-            self.api.send_message(chat_id, f"Send new value for {key}.\n/cancel to stop.")
+            self.api.send_message(chat_id, f"⚙️ {key}\n\n{self.setting_help(key)}\n\nSend new value.\n/cancel to stop.")
         elif data == "adm:toggle_join":
             current = self.store.setting("join_required", "1")
             self.store.set_setting("join_required", "0" if current == "1" else "1")
@@ -1757,21 +2071,27 @@ class BotApp:
             self.store.set_setting("referral_enabled", "0" if current == "1" else "1")
             self.admin_settings(chat_id, message_id=message_id)
         elif data == "adm:orders":
-            self.admin_orders(chat_id)
+            self.admin_orders(chat_id, message_id=message_id)
         elif data == "adm:topups":
-            self.admin_topups(chat_id)
+            self.admin_topups(chat_id, message_id=message_id)
         elif data.startswith("at:"):
-            self.handle_topup_admin(chat_id, data)
+            self.handle_topup_admin(chat_id, data, message_id=message_id)
 
     def admin_products(self, chat_id: int, message_id: int | None = None) -> None:
         rows = []
-        text = ["Products:"]
+        text = [
+            "📦 PRODUCTS",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "Create products, set product emoji, add day/price variants and manage key stock.",
+            "",
+            "Products:",
+        ]
         for p in self.store.products(active_only=False):
             status = "active" if int(p["active"]) else "hidden"
             text.append(f"#{p['id']} {p['emoji'] or '📦'} {p['title']} - {p['variant_count']} variants - {status}")
             rows.append([{"text": f"#{p['id']} {p['emoji'] or '📦'} {p['title']}", "callback_data": f"ap:view:{p['id']}"}])
         rows.append([{"text": "Add Product", "callback_data": "adm:add_product"}, {"text": "Back", "callback_data": "adm:home"}])
-        self.page(chat_id, "\n".join(text) if len(text) > 1 else "No products yet.", {"inline_keyboard": rows}, message_id)
+        self.page(chat_id, "\n".join(text) if len(text) > 5 else "No products yet.", {"inline_keyboard": rows}, message_id)
 
     def handle_product_admin(self, chat_id: int, admin_id: int, data: str, message_id: int | None = None) -> None:
         parts = data.split(":")
@@ -1799,6 +2119,10 @@ class BotApp:
             return
         variants = self.store.variants(product_id, active_only=False)
         lines = [
+            "📦 PRODUCT DETAILS",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "Use this page to add variants, set emoji, hide/show product or delete it.",
+            "",
             f"Product #{product['id']}: {product['emoji'] or '📦'} {product['title']}",
             f"Status: {'active' if int(product['active']) else 'hidden'}",
             f"Description: {product['description'] or '-'}",
@@ -1820,12 +2144,12 @@ class BotApp:
         )
         self.page(chat_id, "\n".join(lines), {"inline_keyboard": rows}, message_id)
 
-    def handle_variant_admin(self, chat_id: int, admin_id: int, data: str) -> None:
+    def handle_variant_admin(self, chat_id: int, admin_id: int, data: str, message_id: int | None = None) -> None:
         parts = data.split(":")
         action = parts[1]
         variant_id = int(parts[2])
         if action == "view":
-            self.admin_variant_detail(chat_id, variant_id)
+            self.admin_variant_detail(chat_id, variant_id, message_id=message_id)
         elif action == "stockadd":
             self.store.set_state(admin_id, "add_stock", {"variant_id": variant_id})
             self.api.send_message(chat_id, "Send stock lines. One stock item per line.\n/cancel to stop.")
@@ -1836,22 +2160,25 @@ class BotApp:
             self.api.send_message(chat_id, "Send stock IDs to delete, comma separated.\nExample: 12,13,14")
         elif action == "toggle":
             self.store.toggle_variant(variant_id)
-            self.admin_variant_detail(chat_id, variant_id)
+            self.admin_variant_detail(chat_id, variant_id, message_id=message_id)
         elif action == "delete":
             variant = self.store.variant(variant_id)
             product_id = int(variant["product_id"]) if variant else 0
             self.store.delete_variant(variant_id)
             if product_id:
-                self.admin_product_detail(chat_id, product_id)
+                self.admin_product_detail(chat_id, product_id, message_id=message_id)
             else:
-                self.admin_products(chat_id)
+                self.admin_products(chat_id, message_id=message_id)
 
-    def admin_variant_detail(self, chat_id: int, variant_id: int) -> None:
+    def admin_variant_detail(self, chat_id: int, variant_id: int, message_id: int | None = None) -> None:
         v = self.store.variant(variant_id)
         if not v:
             self.api.send_message(chat_id, "Variant not found.", self.admin_keyboard())
             return
         text = (
+            "🔑 VARIANT / STOCK\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Add stock keys, list available keys, delete stock IDs, or hide/show this variant.\n\n"
             f"Variant #{v['id']}\n"
             f"Product: {v['product_title']}\n"
             f"Title: {v['title']}\n"
@@ -1868,7 +2195,7 @@ class BotApp:
                 [{"text": "Back to Product", "callback_data": f"ap:view:{v['product_id']}"}],
             ]
         }
-        self.api.send_message(chat_id, text, keyboard)
+        self.page(chat_id, text, keyboard, message_id)
 
     def admin_stock_list(self, chat_id: int, variant_id: int) -> None:
         items = self.store.stock_items(variant_id, limit=20)
@@ -1889,7 +2216,10 @@ class BotApp:
         users = self.store.users(limit=limit, offset=offset, balance_only=balance_only)
         total = self.store.user_count(balance_only=balance_only)
         title = "💰 USERS WITH BALANCE" if balance_only else "👥 USERS"
-        lines = [f"{title}: {total}", "━━━━━━━━━━━━━━━━━━━━", ""]
+        guide = "Open a user to add/deduct balance, ban/unban, DM, custom price, or see orders."
+        if balance_only:
+            guide = "Only users with wallet balance are shown here. Open a user to add or deduct balance."
+        lines = [f"{title}: {total}", "━━━━━━━━━━━━━━━━━━━━", guide, ""]
         rows = []
         for user in users:
             username = f"@{user['username']}" if user["username"] else "-"
@@ -1910,33 +2240,33 @@ class BotApp:
         rows.append([{"text": "⬅️ Back", "callback_data": "adm:home"}])
         self.page(chat_id, "\n".join(lines), {"inline_keyboard": rows}, message_id)
 
-    def handle_user_admin(self, chat_id: int, admin_id: int, data: str) -> None:
+    def handle_user_admin(self, chat_id: int, admin_id: int, data: str, message_id: int | None = None) -> None:
         parts = data.split(":")
         action = parts[1]
         target_id = int(parts[2])
         if action == "view":
-            self.admin_user_detail(chat_id, target_id)
+            self.admin_user_detail(chat_id, target_id, message_id=message_id)
         elif action in {"addbal", "deduct"}:
             self.store.set_state(admin_id, action, {"user_id": target_id})
             self.api.send_message(chat_id, "Send amount. Example: 10.00\n/cancel to stop.")
         elif action == "ban":
             self.store.set_ban(target_id, True, f"admin:{admin_id}")
             self.api.send_message(target_id, self.store.setting("banned_text"))
-            self.admin_user_detail(chat_id, target_id)
+            self.admin_user_detail(chat_id, target_id, message_id=message_id)
         elif action == "unban":
             self.store.set_ban(target_id, False, f"admin:{admin_id}")
             self.api.send_message(target_id, "Your account has been unbanned.")
-            self.admin_user_detail(chat_id, target_id)
+            self.admin_user_detail(chat_id, target_id, message_id=message_id)
         elif action == "dm":
             self.store.set_state(admin_id, "dm_message", {"user_id": target_id})
             self.api.send_message(chat_id, "Send the message/media for this user.\n/cancel to stop.")
         elif action == "orders":
-            self.admin_orders(chat_id, user_id=target_id)
+            self.admin_orders(chat_id, user_id=target_id, message_id=message_id)
         elif action == "customprice":
             self.store.set_state(admin_id, "custom_price", {"user_id": target_id})
             self.api.send_message(chat_id, "Send custom price:\nvariant_id price\n\nExample:\n5 9.99\nUse price 'default' to remove custom price.")
 
-    def admin_user_detail(self, chat_id: int, user_id: int) -> None:
+    def admin_user_detail(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
         user = self.store.user(user_id)
         if not user:
             self.api.send_message(chat_id, "User not found.", self.admin_keyboard())
@@ -1945,6 +2275,7 @@ class BotApp:
         text = (
             "👤 USER DETAILS\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
+            "Manage this customer's wallet, access, custom price, orders and direct messages.\n\n"
             f"🆔 User ID: {user['user_id']}\n"
             f"🔗 Username: {username}\n"
             f"👤 Name: {user['first_name']} {user['last_name'] or ''}\n"
@@ -1961,11 +2292,17 @@ class BotApp:
                 [{"text": "⬅️ Back to Users", "callback_data": "adm:users:0"}],
             ]
         }
-        self.api.send_message(chat_id, text, keyboard)
+        self.page(chat_id, text, keyboard, message_id)
 
-    def admin_channels(self, chat_id: int) -> None:
+    def admin_channels(self, chat_id: int, message_id: int | None = None) -> None:
         channels = self.store.channels(enabled_only=False)
-        lines = ["Join channels:"]
+        lines = [
+            "💭 FORCED JOIN CHANNELS",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "Users must join enabled channels before using the bot. Third line must be @channelusername or numeric chat ID so Verify can check membership.",
+            "",
+            "Join channels:",
+        ]
         rows = []
         for ch in channels:
             lines.append(f"#{ch['id']} {ch['title']} - {'enabled' if int(ch['enabled']) else 'disabled'}\n{ch['link']}\nchat: {ch['chat_id'] or '-'}")
@@ -1976,7 +2313,7 @@ class BotApp:
                 ]
             )
         rows.append([{"text": "Add Channel", "callback_data": "adm:add_channel"}, {"text": "Back", "callback_data": "adm:home"}])
-        self.api.send_message(chat_id, "\n\n".join(lines), {"inline_keyboard": rows})
+        self.page(chat_id, "\n\n".join(lines), {"inline_keyboard": rows}, message_id)
 
     def admin_settings(self, chat_id: int, message_id: int | None = None) -> None:
         s = self.store.settings_map()
@@ -1991,6 +2328,14 @@ class BotApp:
             f"💸 Referral reward: {money(parse_cents(s.get('referral_reward', '0.01')), self.currency())}\n"
             f"👨‍💻 Owner URL: {s.get('owner_url')}\n"
             f"💬 Channel URL: {s.get('channel_url')}\n\n"
+            "🧭 OPTION HELP\n"
+            "┣ ✅ Toggle Join: forced channel join on/off\n"
+            "┣ 👥 Toggle Referral: invite reward on/off\n"
+            "┣ 🔗 Bot Username: required for invite links\n"
+            "┣ 👨‍💻 Owner URL: Contact Admin button link\n"
+            "┣ 💬 Channel URL: Info Bot channel button link\n"
+            "┣ ℹ️ Info Text: How It Works page text\n"
+            "┗ 💳 Payment: top-up instruction text\n\n"
             "👇 Tap a setting to update."
         )
         keyboard = {
@@ -2008,26 +2353,38 @@ class BotApp:
         }
         self.page(chat_id, text, keyboard, message_id)
 
-    def admin_orders(self, chat_id: int, user_id: int | None = None) -> None:
+    def admin_orders(self, chat_id: int, user_id: int | None = None, message_id: int | None = None) -> None:
         orders = self.store.orders(limit=20, user_id=user_id)
         if not orders:
-            self.api.send_message(chat_id, "No orders found.", self.admin_keyboard())
+            self.page(chat_id, "🛒 ORDERS\n━━━━━━━━━━━━━━━━━━━━\nNo orders found.", self.admin_keyboard(), message_id)
             return
-        lines = ["Orders:"]
+        lines = [
+            "🛒 ORDERS",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "Latest purchase history with user, product, duration and price.",
+            "",
+            "Orders:",
+        ]
         for o in orders:
             lines.append(
                 f"#{o['id']} user {o['user_id']} @{o['username'] or '-'}\n"
                 f"{o['product_title']} / {o['variant_title']} ({o['days']} days)\n"
                 f"{money(o['price_cents'], self.currency())} - {o['created_at'][:19]}"
             )
-        self.api.send_message(chat_id, "\n\n".join(lines), self.admin_keyboard())
+        self.page(chat_id, "\n\n".join(lines), self.admin_keyboard(), message_id)
 
-    def admin_topups(self, chat_id: int) -> None:
+    def admin_topups(self, chat_id: int, message_id: int | None = None) -> None:
         topups = self.store.topups(pending_only=False, limit=20)
         if not topups:
-            self.api.send_message(chat_id, "No top-ups found.", self.admin_keyboard())
+            self.page(chat_id, "⏳ TOP-UPS\n━━━━━━━━━━━━━━━━━━━━\nNo top-ups found.", self.admin_keyboard(), message_id)
             return
-        lines = ["Top-ups:"]
+        lines = [
+            "⏳ TOP-UPS",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "Approve or reject manual payment requests. Approve adds balance automatically.",
+            "",
+            "Top-ups:",
+        ]
         rows = []
         for t in topups:
             lines.append(
@@ -2043,16 +2400,16 @@ class BotApp:
                     ]
                 )
         rows.append([{"text": "Back", "callback_data": "adm:home"}])
-        self.api.send_message(chat_id, "\n\n".join(lines), {"inline_keyboard": rows})
+        self.page(chat_id, "\n\n".join(lines), {"inline_keyboard": rows}, message_id)
 
-    def handle_topup_admin(self, chat_id: int, data: str) -> None:
+    def handle_topup_admin(self, chat_id: int, data: str, message_id: int | None = None) -> None:
         _, action, raw_id = data.split(":")
         status = "approved" if action == "approve" else "rejected"
         topup = self.store.update_topup(int(raw_id), status)
         if not topup:
-            self.api.send_message(chat_id, "Top-up not found.", self.admin_keyboard())
+            self.page(chat_id, "Top-up not found.", self.admin_keyboard(), message_id)
             return
-        self.api.send_message(chat_id, f"Top-up #{topup['id']} {status}.", self.admin_keyboard())
+        self.page(chat_id, f"Top-up #{topup['id']} {status}.", self.admin_keyboard(), message_id)
         self.api.send_message(
             int(topup["user_id"]),
             f"Top-up #{topup['id']} {status}: {money(topup['amount_cents'], self.currency())}",
@@ -2107,7 +2464,7 @@ class BotApp:
             elif state == "add_channel":
                 lines = [line.strip() for line in text.splitlines() if line.strip()]
                 if len(lines) < 3:
-                    self.api.send_message(chat_id, "Send:\nTitle\nJoin link\nChat ID or @username")
+                    self.api.send_message(chat_id, "Send:\nTitle\nJoin link\nChat ID or @username\n\nExample:\nChannel 1\nhttps://t.me/yourchannel\n@yourchannel")
                     return
                 self.store.add_channel(lines[0], lines[1], lines[2])
                 self.store.clear_state(admin_id)
@@ -2197,12 +2554,14 @@ def smoke_test() -> None:
     assert int(store.user(101)["balance_cents"]) == 1
     pid = store.add_product("Fluorite Product", "Demo product")
     vid = store.add_variant(pid, "7 Day", 7, parse_cents("12.50"))
-    store.add_stock(vid, ["KEY-001"])
-    store.adjust_balance(101, parse_cents("20"), "smoke")
-    result = store.purchase(101, vid)
+    store.add_stock(vid, ["KEY-001", "KEY-002", "KEY-003"])
+    store.adjust_balance(101, parse_cents("40"), "smoke")
+    result = store.purchase(101, vid, quantity=2)
     assert result["ok"], result
+    assert result["quantity"] == 2
+    assert "KEY-001" in result["content"] and "KEY-002" in result["content"]
     store.adjust_balance(101, parse_cents("20"), "smoke")
-    assert store.purchase(101, vid)["reason"] == "empty_stock"
+    assert store.purchase(101, vid, quantity=2)["reason"] == "empty_stock"
     topup = store.create_topup(101, parse_cents("5"), "manual", "TXN")
     store.update_topup(topup, "approved")
     print("smoke-ok")

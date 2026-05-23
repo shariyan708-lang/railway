@@ -201,6 +201,12 @@ https://t.me/yourchannel
 
 Private channel হলে bot-কে channel/group-এ add করে admin/member করতে হবে, তারপর correct chat ID দিতে হবে। Public channel হলে `@channelusername` ব্যবহার করা যায়।
 
+Important:
+
+- Third line-এ `@channelusername` অথবা numeric chat ID দিতে হবে।
+- Verify button কাজ করার জন্য bot-কে ওই channel-এ admin/member রাখতে হবে।
+- User Verify চাপলে bot fresh Telegram check করবে। Join না থাকলে alert-এ কোন channel বাকি আছে দেখাবে।
+
 ## 8. Product, Variant, Stock Setup
 
 Admin account থেকে:
@@ -247,6 +253,15 @@ KEY-003
 ```
 
 User যখন কিনবে, একটি available stock line user-কে delivery যাবে এবং সেটি sold হয়ে যাবে।
+
+Customer purchase flow:
+
+1. User `Buy Key` চাপবে।
+2. Product select করবে।
+3. Duration/price/stock list দেখবে।
+4. Variant select করলে quantity page আসবে: `1x`, `2x`, `3x`, অথবা `Custom Quantity`।
+5. Confirm page-এ balance, total, after purchase balance দেখাবে।
+6. Confirm করলে success page-এ license key monospace format-এ দেখাবে, যাতে tap-hold করে copy করা যায়।
 
 ## 9. Stock দেখা বা Delete করা
 

@@ -19,6 +19,7 @@ This is a normal Telegram bot, not a Telegram Mini App and not a website. Users 
 - Invite Friends referral link with automatic reward credit
 - Info Bot screen with configurable Owner and Channel links
 - Customer purchase pages use a cleaner single-message flow for product, day/variant and price selection
+- Purchase flow includes quantity selection, confirmation page, and success page with monospace license keys
 - USD prices display with `$` instead of the text `USD`
 - Delivered keys and invite links are sent as separate copy-friendly messages
 - Manual top-up request and admin approval
@@ -183,3 +184,15 @@ KEY-003
 When a user buys that variant, one available stock line is delivered and marked sold.
 
 After creating a product, open it from `/admin > Products` and tap `Set Emoji` to attach an emoji like `💎`, `📦`, `🔑`, or `🎁`.
+
+## Forced Join Verification
+
+From `/admin > Channels > Add Channel`, send:
+
+```text
+Channel 1
+https://t.me/yourchannel
+@yourchannel
+```
+
+The third line is important. It must be `@channelusername` or the numeric channel chat ID, and the bot must be admin/member in that channel so Telegram can verify joins.
