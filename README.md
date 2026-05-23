@@ -27,7 +27,7 @@ This is a normal Telegram bot, not a Telegram Mini App and not a website. Users 
 - Admin order/top-up notifications include View Details and User Orders buttons
 - Admin-managed redeem codes with value and max usage limit
 - Profile page is clean, with separate order history and full TXT export
-- Shop home page with welcome/account summary, stats, balance, transactions and support buttons
+- Main customer UI keeps the classic Buy Key, Invite Friends, Profile, Info Bot and Redeem buttons
 - Admin maintenance mode to pause customer access and notify users when the bot is active again
 - Neon PostgreSQL support through `DATABASE_URL`
 - SQLite fallback for local testing
@@ -105,6 +105,10 @@ python selling_bot.py
 ```
 
 No public domain or port is needed for this bot. It is an always-on background worker that talks to Telegram with long polling. Run only one Railway service for one bot token.
+
+## Neon Optimization
+
+The bot creates its own tables and indexes automatically. For extra Neon performance, you can also run `neon_optimize.sql` once from the Neon SQL Editor after first deploy. It only creates missing indexes and runs `ANALYZE`.
 
 ## User Commands
 

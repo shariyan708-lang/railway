@@ -58,6 +58,7 @@ Repository root-এ এই files থাকা উচিত:
 selling_bot.py
 requirements.txt
 railway.json
+neon_optimize.sql
 render.yaml
 Procfile
 README.md
@@ -93,6 +94,12 @@ BROADCAST_DELAY_SECONDS=0.035
 7. Deploy শেষ হলে Railway logs খুলে দেখুন `Bot is running` টাইপ log আসে কিনা।
 
 Important: এই bot web server না, তাই public domain বা port দরকার নেই। Railway-তে এটাকে always-on background worker/service হিসেবে চালাবেন। একই bot token দিয়ে একসঙ্গে দুই জায়গায় bot চালাবেন না।
+
+## 5.0 Neon Speed Optimize SQL
+
+Bot নিজেই table/index তৈরি করবে। তারপরও extra speed-এর জন্য deploy-এর পরে Neon SQL Editor-এ `neon_optimize.sql` file-এর code একবার run করতে পারেন।
+
+এটি শুধু missing index তৈরি করে এবং `ANALYZE` চালায়, তাই repeated run করলেও সমস্যা নেই।
 
 ## 5.1 Render-এ Deploy করতে চাইলে
 

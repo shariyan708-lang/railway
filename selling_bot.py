@@ -893,18 +893,6 @@ class Store:
             all_rows=True,
         )
 
-    def user_order_summary(self, user_id: int) -> dict[str, int]:
-        row = self.execute(
-            """
-            SELECT COUNT(*) AS purchases, COALESCE(SUM(price_cents), 0) AS total_spent
-            FROM orders
-            WHERE user_id = ? AND status = 'delivered'
-            """,
-            (user_id,),
-            one=True,
-        )
-        return {"purchases": int(row["purchases"] or 0), "total_spent": int(row["total_spent"] or 0)}
-
     def delete_stock_ids(self, variant_id: int, ids: list[int]) -> int:
         if not ids:
             return 0
@@ -1696,10 +1684,6 @@ class BotApp:
             self.show_user_orders(chat_id, user_id, message_id=message_id)
         elif data == "u:orders_export":
             self.export_user_orders(chat_id, user_id)
-        elif data == "u:stats":
-            self.show_user_stats(chat_id, user_id, message_id=message_id)
-        elif data == "u:transactions":
-            self.show_transactions(chat_id, user_id, message_id=message_id)
         elif data == "u:help":
             self.api.send_message(chat_id, self.store.setting("help_text"), self.user_keyboard())
         elif data == "u:contact":
@@ -1711,16 +1695,6 @@ class BotApp:
                 [{"text": "🛒 Buy Key", "callback_data": "u:products"}, {"text": "👥 Invite Friends", "callback_data": "u:invite"}],
                 [{"text": "💳 Profile", "callback_data": "u:profile"}, {"text": "ℹ️ Info Bot", "callback_data": "u:info"}],
                 [{"text": "🎁 Redeem", "callback_data": "u:redeem"}],
-            ]
-        }
-
-    def home_keyboard(self) -> dict[str, Any]:
-        return {
-            "inline_keyboard": [
-                [{"text": "🛒 Shop Now", "callback_data": "u:products"}],
-                [{"text": "📦 My Orders", "callback_data": "u:orders"}, {"text": "📊 My Stats", "callback_data": "u:stats"}],
-                [{"text": "💰 My Balance", "callback_data": "u:balance"}, {"text": "💳 Transactions", "callback_data": "u:transactions"}],
-                [{"text": "📞 Support", "callback_data": "u:contact"}],
             ]
         }
 
@@ -1806,7 +1780,6 @@ class BotApp:
             self.show_join_gate(chat_id)
             return
         user_id = int(user["user_id"])
-        summary = self.store.user_order_summary(user_id)
         name = str(user["first_name"] or user["username"] or "friend").strip()
         bot_name = self.store.setting("bot_name", "our shop")
         text = (
@@ -1816,15 +1789,14 @@ class BotApp:
             f"Welcome to {html_bold(bot_name)}.\n\n"
             "💳 <b>YOUR ACCOUNT</b>\n"
             f"┣ 💰 Balance: {html_code(money(int(user['balance_cents']), self.currency()))}\n"
-            f"┣ 🛍 Purchases: {html_code(summary['purchases'])}\n"
-            f"┗ 💸 Total Spent: {html_code(money(summary['total_spent'], self.currency()))}\n\n"
+            f"┗ 👥 Invites: {html_code(self.store.referral_count(user_id))}\n\n"
             f"{LINE}\n"
             "📝 <i>Select an option below:</i>"
         )
         if message_id:
-            self.page(chat_id, text, self.home_keyboard(), message_id, parse_mode="HTML")
+            self.page(chat_id, text, self.user_keyboard(), message_id, parse_mode="HTML")
         else:
-            self.api.send_message(chat_id, text, self.home_keyboard(), parse_mode="HTML")
+            self.api.send_message(chat_id, text, self.reply_keyboard(), parse_mode="HTML")
 
     def referral_link(self, user_id: int) -> str:
         username = self.bot_username()
@@ -2160,32 +2132,6 @@ class BotApp:
         user = self.store.user(user_id)
         balance = int(user["balance_cents"]) if user else 0
         self.page(chat_id, f"💰 <b>WALLET</b>\n\nYour balance: {html_code(money(balance, self.currency()))}", self.user_keyboard(), message_id, parse_mode="HTML")
-
-    def show_user_stats(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
-        summary = self.store.user_order_summary(user_id)
-        text = (
-            "📊 <b>MY STATS</b>\n"
-            f"{LINE}\n\n"
-            f"🛍 Purchases: {html_code(summary['purchases'])}\n"
-            f"💸 Total Spent: {html_code(money(summary['total_spent'], self.currency()))}\n"
-            f"👥 Invites: {html_code(self.store.referral_count(user_id))}"
-        )
-        self.page(chat_id, text, self.user_keyboard(), message_id, parse_mode="HTML")
-
-    def show_transactions(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
-        orders = self.store.orders(limit=5, user_id=user_id)
-        if not orders:
-            self.page(chat_id, "💳 <b>TRANSACTIONS</b>\n\nNo transactions yet.", self.user_keyboard(), message_id, parse_mode="HTML")
-            return
-        lines = ["💳 <b>TRANSACTIONS</b>", LINE, ""]
-        for order in orders:
-            lines.append(
-                f"🛒 Order #{html_code(order['id'])}\n"
-                f"┣ 📦 {html_code(order['product_title'])}\n"
-                f"┣ 💵 {html_code(money(order['price_cents'], self.currency()))}\n"
-                f"┗ 🕒 {html_code(str(order['created_at'])[:19])}\n"
-            )
-        self.page(chat_id, "\n".join(lines), self.user_keyboard(), message_id, parse_mode="HTML")
 
     def show_topup(self, chat_id: int) -> None:
         self.api.send_message(chat_id, self.store.setting("payment_methods"), self.user_keyboard())
