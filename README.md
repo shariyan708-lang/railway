@@ -27,6 +27,8 @@ This is a normal Telegram bot, not a Telegram Mini App and not a website. Users 
 - Admin order/top-up notifications include View Details and User Orders buttons
 - Admin-managed redeem codes with value and max usage limit
 - Profile page is clean, with separate order history and full TXT export
+- Shop home page with welcome/account summary, stats, balance, transactions and support buttons
+- Admin maintenance mode to pause customer access and notify users when the bot is active again
 - Neon PostgreSQL support through `DATABASE_URL`
 - SQLite fallback for local testing
 - Optimized database indexes, cached settings, cached successful join checks and fast bulk stock insert
@@ -201,6 +203,20 @@ KEY-003
 When a user buys that variant, one available stock line is delivered and marked sold.
 
 After creating a product, open it from `/admin > Products` and tap `Set Emoji` to attach an emoji like `💎`, `📦`, `🔑`, or `🎁`.
+
+Admin variant pages include Add Stock, List Stock, Delete Stock, Export Stock TXT, Activate/Deactivate, and Delete Variant. Stock list/export shows stock IDs, keys, and created timestamps.
+
+## Maintenance Mode
+
+From `/admin`, tap `Maintenance`.
+
+- ON: customers see the maintenance message and cannot use shop features.
+- OFF: customers can use the bot again and all active users receive the active notice.
+
+You can edit these from `/admin > Settings`:
+
+- `Maintenance Text`
+- `Active Notice`
 
 ## Forced Join Verification
 

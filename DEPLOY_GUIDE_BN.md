@@ -264,6 +264,26 @@ Customer purchase flow:
 5. Confirm page-এ balance, total, after purchase balance দেখাবে।
 6. Confirm করলে success page-এ license key monospace format-এ দেখাবে, যাতে tap-hold করে copy করা যায়।
 
+Admin stock tools:
+
+- `Add Stock` = এক line-এ এক key add করুন।
+- `List Stock` = stock ID, key এবং add time দেখাবে।
+- `Export Stock TXT` = সব available stock text file হিসেবে export করবে।
+- Variant active হলে button/status-এ ✅ দেখাবে, inactive হলে ❌ দেখাবে।
+
+## 8.3 Maintenance Mode
+
+Admin account থেকে `/admin` খুলে `Maintenance` চাপলে bot customerদের জন্য off হবে।
+
+- Maintenance ON: user shop/profile/order/redeem ব্যবহার করতে পারবে না, maintenance text দেখবে।
+- Maintenance OFF: bot active হবে এবং সব active user-কে notification যাবে।
+
+Maintenance message edit করতে:
+
+1. `/admin`
+2. `Settings`
+3. `Maintenance Text` অথবা `Active Notice`
+
 ## 8.1 Redeem Code Setup
 
 Admin account থেকে:

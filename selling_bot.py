@@ -532,6 +532,9 @@ class Store:
             "bot_name": "Fluorite Gift",
             "currency": "USD",
             "join_required": "1",
+            "maintenance_mode": "0",
+            "maintenance_text": "🛠 Bot is under maintenance.\n\nPlease try again later.",
+            "maintenance_back_text": "✅ Bot is active again. You can now use the shop.",
             "welcome_text": "Welcome. Use the buttons below.",
             "join_text": "⚠️ ACCESS DENIED!\n\nYou must join our channels to unlock the bot features.",
             "verify_failed_text": "Please join all required channels, then tap Verify again.",
@@ -889,6 +892,18 @@ class Store:
             (variant_id, limit),
             all_rows=True,
         )
+
+    def user_order_summary(self, user_id: int) -> dict[str, int]:
+        row = self.execute(
+            """
+            SELECT COUNT(*) AS purchases, COALESCE(SUM(price_cents), 0) AS total_spent
+            FROM orders
+            WHERE user_id = ? AND status = 'delivered'
+            """,
+            (user_id,),
+            one=True,
+        )
+        return {"purchases": int(row["purchases"] or 0), "total_spent": int(row["total_spent"] or 0)}
 
     def delete_stock_ids(self, variant_id: int, ids: list[int]) -> int:
         if not ids:
@@ -1432,6 +1447,13 @@ class BotApp:
             return 0
         return parse_cents(self.store.setting("referral_reward", "0.01"), 1)
 
+    def maintenance_enabled(self) -> bool:
+        return self.store.setting("maintenance_mode", "0") == "1"
+
+    def show_maintenance(self, chat_id: int, message_id: int | None = None) -> None:
+        text = self.store.setting("maintenance_text", "🛠 Bot is under maintenance.\n\nPlease try again later.")
+        self.page(chat_id, text, None, message_id)
+
     def start_referrer(self, text: str) -> int | None:
         parts = text.split(maxsplit=1)
         if len(parts) != 2 or parts[0].lower() != "/start":
@@ -1534,6 +1556,10 @@ class BotApp:
             self.show_admin_home(chat_id)
             return
 
+        if self.maintenance_enabled():
+            self.show_maintenance(chat_id)
+            return
+
         if text in {"/admin", "admin"}:
             self.api.send_message(chat_id, "Admin panel is not available for this account.")
             return
@@ -1605,6 +1631,10 @@ class BotApp:
             self.show_admin_home(chat_id)
             return
 
+        if self.maintenance_enabled():
+            self.show_maintenance(chat_id, message_id=message_id)
+            return
+
         if int(user["is_banned"]):
             self.api.send_message(chat_id, self.store.setting("banned_text"))
             return
@@ -1666,6 +1696,10 @@ class BotApp:
             self.show_user_orders(chat_id, user_id, message_id=message_id)
         elif data == "u:orders_export":
             self.export_user_orders(chat_id, user_id)
+        elif data == "u:stats":
+            self.show_user_stats(chat_id, user_id, message_id=message_id)
+        elif data == "u:transactions":
+            self.show_transactions(chat_id, user_id, message_id=message_id)
         elif data == "u:help":
             self.api.send_message(chat_id, self.store.setting("help_text"), self.user_keyboard())
         elif data == "u:contact":
@@ -1677,6 +1711,16 @@ class BotApp:
                 [{"text": "🛒 Buy Key", "callback_data": "u:products"}, {"text": "👥 Invite Friends", "callback_data": "u:invite"}],
                 [{"text": "💳 Profile", "callback_data": "u:profile"}, {"text": "ℹ️ Info Bot", "callback_data": "u:info"}],
                 [{"text": "🎁 Redeem", "callback_data": "u:redeem"}],
+            ]
+        }
+
+    def home_keyboard(self) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "🛒 Shop Now", "callback_data": "u:products"}],
+                [{"text": "📦 My Orders", "callback_data": "u:orders"}, {"text": "📊 My Stats", "callback_data": "u:stats"}],
+                [{"text": "💰 My Balance", "callback_data": "u:balance"}, {"text": "💳 Transactions", "callback_data": "u:transactions"}],
+                [{"text": "📞 Support", "callback_data": "u:contact"}],
             ]
         }
 
@@ -1761,16 +1805,26 @@ class BotApp:
         if not self.join_ok(int(user["user_id"])):
             self.show_join_gate(chat_id)
             return
+        user_id = int(user["user_id"])
+        summary = self.store.user_order_summary(user_id)
+        name = str(user["first_name"] or user["username"] or "friend").strip()
+        bot_name = self.store.setting("bot_name", "our shop")
         text = (
-            f"🎉 {self.store.setting('welcome_text')}\n\n"
-            f"💰 Wallet: {money(int(user['balance_cents']), self.currency())}\n"
-            f"👥 Invites: {self.store.referral_count(int(user['user_id']))}\n\n"
-            "👇 Choose an option from the menu below."
+            "🏪 <b>WELCOME TO SHOP</b>\n"
+            f"{LINE}\n\n"
+            f"👋 Hello, {html_bold(name)}!\n"
+            f"Welcome to {html_bold(bot_name)}.\n\n"
+            "💳 <b>YOUR ACCOUNT</b>\n"
+            f"┣ 💰 Balance: {html_code(money(int(user['balance_cents']), self.currency()))}\n"
+            f"┣ 🛍 Purchases: {html_code(summary['purchases'])}\n"
+            f"┗ 💸 Total Spent: {html_code(money(summary['total_spent'], self.currency()))}\n\n"
+            f"{LINE}\n"
+            "📝 <i>Select an option below:</i>"
         )
         if message_id:
-            self.page(chat_id, text, self.user_keyboard(), message_id)
+            self.page(chat_id, text, self.home_keyboard(), message_id, parse_mode="HTML")
         else:
-            self.api.send_message(chat_id, text, self.reply_keyboard())
+            self.api.send_message(chat_id, text, self.home_keyboard(), parse_mode="HTML")
 
     def referral_link(self, user_id: int) -> str:
         username = self.bot_username()
@@ -1811,7 +1865,6 @@ class BotApp:
             "inline_keyboard": [
                 [{"text": "📋 COPY LINK", "callback_data": "u:invite_copy"}],
                 [{"text": "📤 QUICK SHARE", "url": share_url}],
-                [{"text": "⬅️ Back", "callback_data": "u:home"}],
             ]
         }
         self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
@@ -1829,11 +1882,12 @@ class BotApp:
         lines = [
             "💳 <b>MY PROFILE</b>",
             LINE,
+            f"Welcome to {html_bold(self.store.setting('bot_name', 'the shop'))}. Your account details are below.",
             "",
             f"👤 Name: {html_escape((user['first_name'] if user else '-') + (' ' + user['last_name'] if user and user['last_name'] else ''))}",
             f"🆔 User ID: {html_code(user_id)}",
             f"👤 Username: {html_code(username)}",
-            f"📅 Member Since: {html_code(user['created_at'][:10] if user else '-')}",
+            f"📅 Member Since: <i>{html_escape(user['created_at'][:10] if user else '-')}</i>",
             "",
             f"💰 Wallet: {html_bold(money(int(user['balance_cents']) if user else 0, self.currency()))}",
             f"👥 Invites: {html_bold(self.store.referral_count(user_id))}",
@@ -1879,7 +1933,6 @@ class BotApp:
             self.page(chat_id, "🛒 BUY KEY\n\nNo products are available right now.", self.user_keyboard(), message_id)
             return
         rows = [[{"text": f"{p['emoji'] or '📦'} {p['title']}", "callback_data": f"u:p:{p['id']}"}] for p in products]
-        rows.append([{"text": "⬅️ Back", "callback_data": "u:home"}])
         self.page(chat_id, "🛒 BUY KEY\n\nSelect a product:", {"inline_keyboard": rows}, message_id)
 
     def show_product_variants(self, chat_id: int, user_id: int, product_id: int, message_id: int | None = None) -> None:
@@ -1896,7 +1949,7 @@ class BotApp:
         balance = int(user["balance_cents"]) if user else 0
         custom_prices = self.store.custom_price_map(user_id, [int(v["id"]) for v in variants])
         lines = [
-            f"{product['emoji'] or '📦'} <b>{html_escape(product['title'])}</b>",
+            f"{product['emoji'] or '📦'} {html_code(product['title'])}",
         ]
         if product["description"]:
             lines.append(f"📝 {html_escape(product['description'])}")
@@ -1915,8 +1968,8 @@ class BotApp:
             duration = self.duration_label(int(v["days"]))
             lines.append(
                 f"✅ <b>{html_escape(duration)}</b>\n"
-                f"┣ 💵 Price: {html_bold(money(price, self.currency()))}\n"
-                f"┗ 📦 Stock: {html_bold(str(v['stock_count']))} available\n"
+                f"┣ 💵 Price: {html_code(money(price, self.currency()))}\n"
+                f"┗ 📦 Stock: {html_code(v['stock_count'])} available\n"
             )
             rows.append(
                 [
@@ -1950,12 +2003,12 @@ class BotApp:
             "🛒 <b>SELECT QUANTITY</b>\n"
             f"{LINE}\n\n"
             "📦 <b>Product Details</b>\n"
-            f"┣ {variant['product_emoji'] or '📦'} {html_bold(variant['product_title'])}\n"
-            f"┣ ⏱ Duration: {html_bold(duration)}\n"
-            f"┣ 💵 Unit Price: {html_bold(money(price, self.currency()))}\n"
-            f"┗ 📦 Available: {html_bold(str(stock_count))} keys\n\n"
+            f"┣ {variant['product_emoji'] or '📦'} {html_code(variant['product_title'])}\n"
+            f"┣ ⏱ Duration: {html_code(int(variant['days']))} Days\n"
+            f"┣ 💵 Unit Price: {html_code(money(price, self.currency()))}\n"
+            f"┗ 📦 Available: {html_code(stock_count)} keys\n\n"
             "💳 <b>Your Account</b>\n"
-            f"┗ 💰 Balance: {html_bold(money(balance, self.currency()))}\n\n"
+            f"┗ 💰 Balance: {html_code(money(balance, self.currency()))}\n\n"
             f"{LINE}\n"
             "<i>Select quantity to purchase:</i>"
         )
@@ -2007,16 +2060,16 @@ class BotApp:
         if stock_count < quantity:
             text = (
                 "📦 <b>NOT ENOUGH STOCK</b>\n\n"
-                f"Available keys: {html_bold(stock_count)}\n"
-                f"Requested quantity: {html_bold(quantity)}"
+                f"Available keys: {html_code(stock_count)}\n"
+                f"Requested quantity: {html_code(quantity)}"
             )
             self.page(chat_id, text, {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": f"u:q:{variant_id}"}]]}, message_id, parse_mode="HTML")
             return
         if balance < total:
             text = (
                 "💰 <b>INSUFFICIENT BALANCE</b>\n\n"
-                f"Required: {html_bold(money(total, self.currency()))}\n"
-                f"Your balance: {html_bold(money(balance, self.currency()))}\n\n"
+                f"Required: {html_code(money(total, self.currency()))}\n"
+                f"Your balance: {html_code(money(balance, self.currency()))}\n\n"
                 "Please contact admin to add balance."
             )
             self.page(chat_id, text, self.contact_admin_keyboard(), message_id, parse_mode="HTML")
@@ -2026,13 +2079,13 @@ class BotApp:
             "✅ <b>CONFIRM PURCHASE</b>\n"
             f"{LINE}\n\n"
             "📦 <b>Order Summary</b>\n"
-            f"┣ {variant['product_emoji'] or '📦'} {html_bold(variant['product_title'])}\n"
-            f"┣ ⏱ Duration: {html_bold(duration)}\n"
-            f"┣ 📦 Quantity: {html_bold(quantity)}\n"
-            f"┗ 💵 Total: {html_bold(money(total, self.currency()))}\n\n"
+            f"┣ {variant['product_emoji'] or '📦'} {html_code(variant['product_title'])}\n"
+            f"┣ ⏱ Duration: {html_code(int(variant['days']))} Days\n"
+            f"┣ 📦 Quantity: {html_code(quantity)}\n"
+            f"┗ 💵 Total: {html_code(money(total, self.currency()))}\n\n"
             "💳 <b>Payment Details</b>\n"
-            f"┣ 💰 Your Balance: {html_bold(money(balance, self.currency()))}\n"
-            f"┗ 💳 After Purchase: {html_bold(money(after_balance, self.currency()))}\n\n"
+            f"┣ 💰 Your Balance: {html_code(money(balance, self.currency()))}\n"
+            f"┗ 💳 After Purchase: {html_code(money(after_balance, self.currency()))}\n\n"
             f"{LINE}\n"
             "⚠️ <i>Please review your order carefully.\nClick confirm to complete purchase!</i>"
         )
@@ -2071,12 +2124,12 @@ class BotApp:
             f"🎉 <b>{html_escape(self.store.setting('order_success_text', 'PURCHASE SUCCESSFUL!'))}</b>\n"
             f"{LINE}\n\n"
             "📦 <b>Order Details</b>\n"
-            f"┣ {variant['product_emoji'] or '📦'} {html_bold(variant['product_title'])}\n"
-            f"┣ ⏱ Duration: {html_bold(duration)}\n"
-            f"┣ 📦 Quantity: {html_bold(result.get('quantity', quantity))}\n"
-            f"┗ 💵 Total Paid: {html_bold(money(result['price_cents'], self.currency()))}\n\n"
+            f"┣ {variant['product_emoji'] or '📦'} {html_code(variant['product_title'])}\n"
+            f"┣ ⏱ Duration: {html_code(int(variant['days']))} Days\n"
+            f"┣ 📦 Quantity: {html_code(result.get('quantity', quantity))}\n"
+            f"┗ 💵 Total Paid: {html_code(money(result['price_cents'], self.currency()))}\n\n"
             "💳 <b>Payment</b>\n"
-            f"┗ 💰 New Balance: {html_bold(money(result.get('new_balance_cents', 0), self.currency()))}\n\n"
+            f"┗ 💰 New Balance: {html_code(money(result.get('new_balance_cents', 0), self.currency()))}\n\n"
             f"{LINE}\n"
             "🔑 <b>Your License Key(s):</b>\n\n"
             f"{html_code(content)}\n\n"
@@ -2106,7 +2159,33 @@ class BotApp:
     def show_balance(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
         user = self.store.user(user_id)
         balance = int(user["balance_cents"]) if user else 0
-        self.page(chat_id, f"💰 WALLET\n\nYour balance: {money(balance, self.currency())}", self.user_keyboard(), message_id)
+        self.page(chat_id, f"💰 <b>WALLET</b>\n\nYour balance: {html_code(money(balance, self.currency()))}", self.user_keyboard(), message_id, parse_mode="HTML")
+
+    def show_user_stats(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
+        summary = self.store.user_order_summary(user_id)
+        text = (
+            "📊 <b>MY STATS</b>\n"
+            f"{LINE}\n\n"
+            f"🛍 Purchases: {html_code(summary['purchases'])}\n"
+            f"💸 Total Spent: {html_code(money(summary['total_spent'], self.currency()))}\n"
+            f"👥 Invites: {html_code(self.store.referral_count(user_id))}"
+        )
+        self.page(chat_id, text, self.user_keyboard(), message_id, parse_mode="HTML")
+
+    def show_transactions(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
+        orders = self.store.orders(limit=5, user_id=user_id)
+        if not orders:
+            self.page(chat_id, "💳 <b>TRANSACTIONS</b>\n\nNo transactions yet.", self.user_keyboard(), message_id, parse_mode="HTML")
+            return
+        lines = ["💳 <b>TRANSACTIONS</b>", LINE, ""]
+        for order in orders:
+            lines.append(
+                f"🛒 Order #{html_code(order['id'])}\n"
+                f"┣ 📦 {html_code(order['product_title'])}\n"
+                f"┣ 💵 {html_code(money(order['price_cents'], self.currency()))}\n"
+                f"┗ 🕒 {html_code(str(order['created_at'])[:19])}\n"
+            )
+        self.page(chat_id, "\n".join(lines), self.user_keyboard(), message_id, parse_mode="HTML")
 
     def show_topup(self, chat_id: int) -> None:
         self.api.send_message(chat_id, self.store.setting("payment_methods"), self.user_keyboard())
@@ -2226,7 +2305,7 @@ class BotApp:
                 [{"text": "👥 Users", "callback_data": "adm:users:0"}, {"text": "💰 Balance", "callback_data": "adm:balances:0"}],
                 [{"text": "📣 Broadcast", "callback_data": "adm:broadcast"}, {"text": "💬 Direct Message", "callback_data": "adm:dm"}],
                 [{"text": "💭 Channels", "callback_data": "adm:channels"}, {"text": "🎁 Redeem Codes", "callback_data": "adm:redeems"}],
-                [{"text": "⚙️ Settings", "callback_data": "adm:settings"}],
+                [{"text": "🛠 Maintenance", "callback_data": "adm:toggle_maintenance"}, {"text": "⚙️ Settings", "callback_data": "adm:settings"}],
                 [{"text": "🛒 Orders", "callback_data": "adm:orders"}, {"text": "⏳ Top-ups", "callback_data": "adm:topups"}],
             ]
         }
@@ -2248,6 +2327,7 @@ class BotApp:
             "┣ 📣 Broadcast: send one message to every active user\n"
             "┣ 💭 Channels: forced join channel links and verify chat IDs\n"
             "┣ 🎁 Redeem Codes: create claim codes with value and usage limit\n"
+            "┣ 🛠 Maintenance: turn customer access on/off\n"
             "┗ ⚙️ Settings: owner/channel/info/help/payment texts\n"
         )
 
@@ -2266,6 +2346,8 @@ class BotApp:
             "info_text": "Info Bot body text. Default layout becomes HOW IT WORKS.",
             "redeem_text": "Text shown when user taps Redeem.",
             "payment_methods": "Manual top-up payment instruction.",
+            "maintenance_text": "Message shown to users while maintenance mode is enabled.",
+            "maintenance_back_text": "Message sent to users when maintenance mode is disabled again.",
         }
         return helps.get(key, "Send the new value for this setting.")
 
@@ -2286,6 +2368,7 @@ class BotApp:
             f"┗ 💵 Sales: {money(s['today_sales'], self.currency())}\n\n"
             f"⏳ Pending Top-ups: {s['topups']}\n"
             f"🚫 Banned Users: {s['banned']}\n\n"
+            f"🛠 Maintenance: {'❌ ON' if self.maintenance_enabled() else '✅ OFF'}\n\n"
             f"{self.admin_menu_guide()}\n"
             "🎲 Select a menu below:"
         )
@@ -2364,6 +2447,15 @@ class BotApp:
             self.admin_channels(chat_id, message_id=message_id)
         elif data == "adm:settings":
             self.admin_settings(chat_id, message_id=message_id)
+        elif data == "adm:toggle_maintenance":
+            current = self.store.setting("maintenance_mode", "0")
+            turning_on = current != "1"
+            self.store.set_setting("maintenance_mode", "1" if turning_on else "0")
+            if turning_on:
+                self.page(chat_id, "🛠 Maintenance mode is now ON.\nCustomers will see the maintenance message.", self.admin_keyboard(), message_id)
+            else:
+                self.page(chat_id, "✅ Maintenance mode is now OFF.\nCustomers can use the bot again.", self.admin_keyboard(), message_id)
+                self.notify_users(self.store.setting("maintenance_back_text", "✅ Bot is active again. You can now use the shop."))
         elif data.startswith("adm:set:"):
             key = data.split(":", 2)[2]
             self.store.set_state(admin_id, "set_setting", {"key": key})
@@ -2459,7 +2551,7 @@ class BotApp:
             "Use this page to add variants, set emoji, hide/show product or delete it.",
             "",
             f"Product #{product['id']}: {product['emoji'] or '📦'} {product['title']}",
-            f"Status: {'active' if int(product['active']) else 'hidden'}",
+            f"Status: {'✅ active' if int(product['active']) else '❌ hidden'}",
             f"Description: {product['description'] or '-'}",
             "",
             "Variants:",
@@ -2470,11 +2562,12 @@ class BotApp:
                 f"#{v['id']} {v['title']} ({v['days']} days) - {money(v['price_cents'], self.currency())} - stock {v['stock_count']}/{v['total_stock_count']}"
             )
             rows.append([{"text": f"Variant #{v['id']} {v['title']}", "callback_data": f"av:view:{v['id']}"}])
+        product_toggle = "❌ Hide Product" if int(product["active"]) else "✅ Show Product"
         rows.extend(
             [
                 [{"text": "➕ Add Variant", "callback_data": f"ap:addvar:{product_id}"}, {"text": "🎨 Set Emoji", "callback_data": f"ap:emoji:{product_id}"}],
-                [{"text": "Toggle Active", "callback_data": f"ap:toggle:{product_id}"}, {"text": "Delete Product", "callback_data": f"ap:delete:{product_id}"}],
-                [{"text": "Back", "callback_data": "adm:products"}],
+                [{"text": product_toggle, "callback_data": f"ap:toggle:{product_id}"}, {"text": "🗑 Delete Product", "callback_data": f"ap:delete:{product_id}"}],
+                [{"text": "⬅️ Back", "callback_data": "adm:products"}],
             ]
         )
         self.page(chat_id, "\n".join(lines), {"inline_keyboard": rows}, message_id)
@@ -2487,12 +2580,14 @@ class BotApp:
             self.admin_variant_detail(chat_id, variant_id, message_id=message_id)
         elif action == "stockadd":
             self.store.set_state(admin_id, "add_stock", {"variant_id": variant_id})
-            self.api.send_message(chat_id, "Send stock lines. One stock item per line.\n/cancel to stop.")
+            self.api.send_message(chat_id, "➕ Add Stock\n\n🔑 Send stock keys, one key per line.\n📌 Each line will become one available key.\n\nExample:\nKEY-001\nKEY-002\n\n/cancel to stop.")
         elif action == "stocklist":
             self.admin_stock_list(chat_id, variant_id)
+        elif action == "stockexport":
+            self.admin_stock_export(chat_id, variant_id)
         elif action == "stockdel":
             self.store.set_state(admin_id, "delete_stock", {"variant_id": variant_id})
-            self.api.send_message(chat_id, "Send stock IDs to delete, comma separated.\nExample: 12,13,14")
+            self.api.send_message(chat_id, "🗑 Delete Stock\n\nSend stock IDs to delete, comma separated.\n\nExample:\n12,13,14\n\n/cancel to stop.")
         elif action == "toggle":
             self.store.toggle_variant(variant_id)
             self.admin_variant_detail(chat_id, variant_id, message_id=message_id)
@@ -2511,39 +2606,80 @@ class BotApp:
             self.api.send_message(chat_id, "Variant not found.", self.admin_keyboard())
             return
         text = (
-            "🔑 VARIANT / STOCK\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🔑 <b>VARIANT / STOCK</b>\n"
+            f"{LINE}\n"
             "Add stock keys, list available keys, delete stock IDs, or hide/show this variant.\n\n"
-            f"Variant #{v['id']}\n"
-            f"Product: {v['product_title']}\n"
-            f"Title: {v['title']}\n"
-            f"Days: {v['days']}\n"
-            f"Price: {money(v['price_cents'], self.currency())}\n"
-            f"Status: {'active' if int(v['active']) else 'hidden'}\n"
-            f"Stock: {v['stock_count']} available / {v['total_stock_count']} total"
+            f"🧩 Variant: {html_code('#' + str(v['id']))}\n"
+            f"📦 Product: {html_code(v['product_title'])}\n"
+            f"🏷 Title: {html_escape(v['title'])}\n"
+            f"⏱ Days: {html_code(v['days'])}\n"
+            f"💵 Price: {html_code(money(v['price_cents'], self.currency()))}\n"
+            f"📌 Status: {'✅ active' if int(v['active']) else '❌ inactive'}\n"
+            f"🔑 Stock: {html_code(v['stock_count'])} available / {html_code(v['total_stock_count'])} total"
         )
+        toggle_text = "❌ Deactivate" if int(v["active"]) else "✅ Activate"
         keyboard = {
             "inline_keyboard": [
-                [{"text": "Add Stock", "callback_data": f"av:stockadd:{variant_id}"}, {"text": "List Stock", "callback_data": f"av:stocklist:{variant_id}"}],
-                [{"text": "Delete Stock", "callback_data": f"av:stockdel:{variant_id}"}, {"text": "Toggle Active", "callback_data": f"av:toggle:{variant_id}"}],
-                [{"text": "Delete Variant", "callback_data": f"av:delete:{variant_id}"}],
-                [{"text": "Back to Product", "callback_data": f"ap:view:{v['product_id']}"}],
+                [{"text": "➕ Add Stock", "callback_data": f"av:stockadd:{variant_id}"}, {"text": "📋 List Stock", "callback_data": f"av:stocklist:{variant_id}"}],
+                [{"text": "📥 Export Stock", "callback_data": f"av:stockexport:{variant_id}"}, {"text": "🗑 Delete Stock", "callback_data": f"av:stockdel:{variant_id}"}],
+                [{"text": toggle_text, "callback_data": f"av:toggle:{variant_id}"}, {"text": "🗑 Delete Variant", "callback_data": f"av:delete:{variant_id}"}],
+                [{"text": "⬅️ Back to Product", "callback_data": f"ap:view:{v['product_id']}"}],
             ]
         }
-        self.page(chat_id, text, keyboard, message_id)
+        self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
 
     def admin_stock_list(self, chat_id: int, variant_id: int) -> None:
         items = self.store.stock_items(variant_id, limit=20)
         if not items:
-            self.api.send_message(chat_id, "No available stock for this variant.")
+            self.api.send_message(chat_id, "📋 No available stock for this variant.")
             return
-        lines = ["Available stock, first 20:"]
+        variant = self.store.variant(variant_id)
+        lines = [
+            "📋 <b>AVAILABLE STOCK</b>",
+            LINE,
+            f"📦 Product: {html_code(variant['product_title']) if variant else '-'}",
+            f"🧩 Variant ID: {html_code(variant_id)}",
+            f"🕒 Export Time: {html_code(now_iso())}",
+            "",
+        ]
         for item in items:
             content = str(item["content"])
             if len(content) > 120:
                 content = content[:117] + "..."
-            lines.append(f"#{item['id']}: {content}")
-        self.api.send_message(chat_id, "\n".join(lines))
+            lines.append(
+                f"#{item['id']} 🔑 {html_code(content)}\n"
+                f"┗ 🕒 {html_code(str(item['created_at'])[:19])}"
+            )
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "📥 Export Stock TXT", "callback_data": f"av:stockexport:{variant_id}"}],
+                [{"text": "⬅️ Back to Variant", "callback_data": f"av:view:{variant_id}"}],
+            ]
+        }
+        self.api.send_message(chat_id, "\n".join(lines), keyboard, parse_mode="HTML")
+
+    def admin_stock_export(self, chat_id: int, variant_id: int) -> None:
+        items = self.store.stock_items(variant_id, limit=5000)
+        variant = self.store.variant(variant_id)
+        if not items:
+            self.api.send_message(chat_id, "📋 No stock to export.")
+            return
+        lines = [
+            f"Available stock export",
+            f"Product: {variant['product_title'] if variant else '-'}",
+            f"Variant ID: {variant_id}",
+            f"Export Time: {now_iso()}",
+            "",
+        ]
+        for item in items:
+            lines.append(f"#{item['id']} | {item['content']} | {item['created_at']}")
+        self.api.send_document(
+            chat_id,
+            f"stock-variant-{variant_id}.txt",
+            "\n".join(lines),
+            caption="📥 Stock export",
+            reply_markup={"inline_keyboard": [[{"text": "⬅️ Back to Variant", "callback_data": f"av:view:{variant_id}"}]]},
+        )
 
     def admin_users(self, chat_id: int, page: int, balance_only: bool, message_id: int | None = None) -> None:
         limit = 10
@@ -2663,12 +2799,14 @@ class BotApp:
             f"🔗 Bot username: @{s.get('bot_username') or 'not_set'}\n"
             f"💵 Currency: {s.get('currency')}\n"
             f"✅ Join required: {s.get('join_required')}\n\n"
+            f"🛠 Maintenance: {s.get('maintenance_mode', '0')}\n"
             f"👥 Referral: {s.get('referral_enabled')}\n"
             f"💸 Referral reward: {money(parse_cents(s.get('referral_reward', '0.01')), self.currency())}\n"
             f"👨‍💻 Owner URL: {s.get('owner_url')}\n"
             f"💬 Channel URL: {s.get('channel_url')}\n\n"
             "🧭 OPTION HELP\n"
             "┣ ✅ Toggle Join: forced channel join on/off\n"
+            "┣ 🛠 Maintenance: customer access on/off\n"
             "┣ 👥 Toggle Referral: invite reward on/off\n"
             "┣ 🔗 Bot Username: required for invite links\n"
             "┣ 👨‍💻 Owner URL: Contact Admin button link\n"
@@ -2679,13 +2817,15 @@ class BotApp:
         )
         keyboard = {
             "inline_keyboard": [
-                [{"text": "✅ Toggle Join", "callback_data": "adm:toggle_join"}, {"text": "👥 Toggle Referral", "callback_data": "adm:toggle_referral"}],
+                [{"text": "✅ Toggle Join", "callback_data": "adm:toggle_join"}, {"text": "🛠 Maintenance", "callback_data": "adm:toggle_maintenance"}],
+                [{"text": "👥 Toggle Referral", "callback_data": "adm:toggle_referral"}],
                 [{"text": "🤖 Bot Name", "callback_data": "adm:set:bot_name"}, {"text": "💵 Currency", "callback_data": "adm:set:currency"}],
                 [{"text": "🔗 Bot Username", "callback_data": "adm:set:bot_username"}, {"text": "💸 Referral Reward", "callback_data": "adm:set:referral_reward"}],
                 [{"text": "👨‍💻 Owner URL", "callback_data": "adm:set:owner_url"}, {"text": "💬 Channel URL", "callback_data": "adm:set:channel_url"}],
                 [{"text": "🎉 Welcome", "callback_data": "adm:set:welcome_text"}, {"text": "🚪 Join Text", "callback_data": "adm:set:join_text"}],
                 [{"text": "🆘 Help", "callback_data": "adm:set:help_text"}, {"text": "☎️ Contact", "callback_data": "adm:set:contact_text"}],
                 [{"text": "ℹ️ Info Text", "callback_data": "adm:set:info_text"}, {"text": "🎁 Redeem Text", "callback_data": "adm:set:redeem_text"}],
+                [{"text": "🛠 Maintenance Text", "callback_data": "adm:set:maintenance_text"}, {"text": "✅ Active Notice", "callback_data": "adm:set:maintenance_back_text"}],
                 [{"text": "💳 Payment", "callback_data": "adm:set:payment_methods"}],
                 [{"text": "⬅️ Back", "callback_data": "adm:home"}],
             ]
@@ -2902,6 +3042,14 @@ class BotApp:
     def notify_admins(self, text: str, reply_markup: dict[str, Any] | None = None) -> None:
         for admin_id in self.admins:
             self.api.send_message(admin_id, text, reply_markup)
+
+    def notify_users(self, text: str) -> None:
+        for user_id in self.store.all_user_ids():
+            if user_id in self.admins:
+                continue
+            self.api.send_message(user_id, text)
+            if self.broadcast_delay > 0:
+                time.sleep(self.broadcast_delay)
 
 
 def smoke_test() -> None:
