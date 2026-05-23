@@ -88,6 +88,10 @@ BOT_USERNAME=আপনার bot username, @ ছাড়া
 DATABASE_URL=Neon PostgreSQL connection string
 JOIN_CACHE_SECONDS=300
 SETTINGS_CACHE_SECONDS=5
+PG_CONNECT_TIMEOUT=10
+PG_KEEPALIVES_IDLE=30
+PG_KEEPALIVES_INTERVAL=10
+PG_KEEPALIVES_COUNT=5
 BROADCAST_DELAY_SECONDS=0.035
 ```
 
@@ -100,6 +104,8 @@ Important: এই bot web server না, তাই public domain বা port দ
 Bot নিজেই table/index তৈরি করবে। তারপরও extra speed-এর জন্য deploy-এর পরে Neon SQL Editor-এ `neon_optimize.sql` file-এর code একবার run করতে পারেন।
 
 এটি শুধু missing index তৈরি করে এবং `ANALYZE` চালায়, তাই repeated run করলেও সমস্যা নেই।
+
+Neon idle SSL connection বন্ধ করে দিলে bot নিজে একবার fresh PostgreSQL connection নিয়ে query retry করবে। তাই `SSL connection has been closed unexpectedly` টাইপ error হলে সাধারণত service restart ছাড়াই recover করবে।
 
 ## 5.1 Render-এ Deploy করতে চাইলে
 
@@ -128,6 +134,10 @@ BOT_USERNAME=আপনার bot username, @ ছাড়া
 DATABASE_URL=Neon PostgreSQL connection string
 JOIN_CACHE_SECONDS=300
 SETTINGS_CACHE_SECONDS=5
+PG_CONNECT_TIMEOUT=10
+PG_KEEPALIVES_IDLE=30
+PG_KEEPALIVES_INTERVAL=10
+PG_KEEPALIVES_COUNT=5
 BROADCAST_DELAY_SECONDS=0.035
 ```
 

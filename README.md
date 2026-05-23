@@ -45,6 +45,10 @@ DATABASE_URL=postgresql://user:password@host/dbname?sslmode=require
 DB_PATH=data/telegram_selling_bot.sqlite3
 JOIN_CACHE_SECONDS=300
 SETTINGS_CACHE_SECONDS=5
+PG_CONNECT_TIMEOUT=10
+PG_KEEPALIVES_IDLE=30
+PG_KEEPALIVES_INTERVAL=10
+PG_KEEPALIVES_COUNT=5
 BROADCAST_DELAY_SECONDS=0.035
 ```
 
@@ -75,6 +79,10 @@ python selling_bot.py --smoke-test
    - `DATABASE_URL`
    - `JOIN_CACHE_SECONDS` optional
    - `SETTINGS_CACHE_SECONDS` optional
+   - `PG_CONNECT_TIMEOUT` optional
+   - `PG_KEEPALIVES_IDLE` optional
+   - `PG_KEEPALIVES_INTERVAL` optional
+   - `PG_KEEPALIVES_COUNT` optional
    - `BROADCAST_DELAY_SECONDS` optional
 5. Render start command:
 
@@ -97,6 +105,10 @@ This bot uses Telegram long polling, so it should be deployed as a single Render
    - `DATABASE_URL`
    - `JOIN_CACHE_SECONDS` optional
    - `SETTINGS_CACHE_SECONDS` optional
+   - `PG_CONNECT_TIMEOUT` optional
+   - `PG_KEEPALIVES_IDLE` optional
+   - `PG_KEEPALIVES_INTERVAL` optional
+   - `PG_KEEPALIVES_COUNT` optional
    - `BROADCAST_DELAY_SECONDS` optional
 6. Railway will use `railway.json` and run:
 
@@ -109,6 +121,8 @@ No public domain or port is needed for this bot. It is an always-on background w
 ## Neon Optimization
 
 The bot creates its own tables and indexes automatically. For extra Neon performance, you can also run `neon_optimize.sql` once from the Neon SQL Editor after first deploy. It only creates missing indexes and runs `ANALYZE`.
+
+The bot also retries once with a fresh PostgreSQL connection if Neon closes an idle SSL connection, which prevents crashes like `SSL connection has been closed unexpectedly`.
 
 ## User Commands
 

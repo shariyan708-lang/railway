@@ -139,16 +139,19 @@ class Store:
         self._settings_cache: dict[str, str] | None = None
         self._settings_cache_until = 0.0
         self._channels_cache: dict[bool, tuple[float, list[Any]]] = {}
+        self.psycopg = None
+        self.pg_dict_row = None
         if self.is_pg:
             try:
                 import psycopg
                 from psycopg.rows import dict_row
             except ImportError as exc:
                 raise RuntimeError(
-                    "PostgreSQL mode needs psycopg. Install requirements.txt on Render."
+                    "PostgreSQL mode needs psycopg. Install requirements.txt on Railway/Render."
                 ) from exc
-            self.conn = psycopg.connect(self.database_url, row_factory=dict_row)
-            self.conn.autocommit = True
+            self.psycopg = psycopg
+            self.pg_dict_row = dict_row
+            self.conn = self.connect_pg()
         else:
             path = db_path or DEFAULT_DB
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,6 +170,53 @@ class Store:
     def q(self, sql: str) -> str:
         return sql.replace("?", "%s") if self.is_pg else sql
 
+    def pg_int_env(self, name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except ValueError:
+            return default
+
+    def connect_pg(self) -> Any:
+        conn = self.psycopg.connect(
+            self.database_url,
+            row_factory=self.pg_dict_row,
+            connect_timeout=self.pg_int_env("PG_CONNECT_TIMEOUT", 10),
+            keepalives=1,
+            keepalives_idle=self.pg_int_env("PG_KEEPALIVES_IDLE", 30),
+            keepalives_interval=self.pg_int_env("PG_KEEPALIVES_INTERVAL", 10),
+            keepalives_count=self.pg_int_env("PG_KEEPALIVES_COUNT", 5),
+        )
+        conn.autocommit = True
+        return conn
+
+    def is_connection_error(self, exc: Exception) -> bool:
+        if not self.is_pg or self.psycopg is None:
+            return False
+        return isinstance(exc, (self.psycopg.OperationalError, self.psycopg.InterfaceError))
+
+    def reconnect_pg(self) -> None:
+        if not self.is_pg:
+            return
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.conn = self.connect_pg()
+        self.invalidate_settings_cache()
+        self.invalidate_channels_cache()
+
+    def retry_pg_once(self, action: Any) -> Any:
+        for attempt in range(2):
+            try:
+                return action()
+            except Exception as exc:
+                if self.is_connection_error(exc) and attempt == 0:
+                    print("Database connection lost; reconnecting to PostgreSQL.", flush=True)
+                    self.reconnect_pg()
+                    continue
+                raise
+        return None
+
     def execute(
         self,
         sql: str,
@@ -176,39 +226,58 @@ class Store:
         all_rows: bool = False,
     ) -> Any:
         with self.lock:
-            cur = self.conn.execute(self.q(sql), params)
-            result = None
-            if one:
-                result = cur.fetchone()
-            elif all_rows:
-                result = cur.fetchall()
-            if not self.is_pg and not sql.lstrip().upper().startswith("SELECT"):
-                self.conn.commit()
-            return result if (one or all_rows) else cur
+            def run() -> Any:
+                cur = self.conn.execute(self.q(sql), params)
+                result = None
+                if one:
+                    result = cur.fetchone()
+                elif all_rows:
+                    result = cur.fetchall()
+                if not self.is_pg and not sql.lstrip().upper().startswith("SELECT"):
+                    self.conn.commit()
+                return result if (one or all_rows) else cur
+
+            return self.retry_pg_once(run) if self.is_pg else run()
 
     def execute_many(self, sql: str, rows: list[tuple[Any, ...]]) -> int:
         if not rows:
             return 0
         with self.lock:
-            self.begin()
-            try:
-                cur = self.conn.cursor()
-                cur.executemany(self.q(sql), rows)
-                count = int(cur.rowcount or 0)
-                self.commit()
-                return count
-            except Exception:
-                self.rollback()
-                raise
+            def run() -> int:
+                self.begin()
+                try:
+                    cur = self.conn.cursor()
+                    cur.executemany(self.q(sql), rows)
+                    count = int(cur.rowcount or 0)
+                    self.commit()
+                    return count
+                except Exception:
+                    self.rollback()
+                    raise
+
+            return self.retry_pg_once(run) if self.is_pg else run()
 
     def begin(self) -> None:
-        self.conn.execute("BEGIN" if self.is_pg else "BEGIN IMMEDIATE")
+        try:
+            self.conn.execute("BEGIN" if self.is_pg else "BEGIN IMMEDIATE")
+        except Exception as exc:
+            if self.is_connection_error(exc):
+                self.reconnect_pg()
+                self.conn.execute("BEGIN")
+                return
+            raise
 
     def commit(self) -> None:
         self.conn.execute("COMMIT")
 
     def rollback(self) -> None:
-        self.conn.execute("ROLLBACK")
+        try:
+            self.conn.execute("ROLLBACK")
+        except Exception as exc:
+            if self.is_connection_error(exc):
+                self.reconnect_pg()
+                return
+            raise
 
     def init_schema(self) -> None:
         if self.is_pg:
