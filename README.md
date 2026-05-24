@@ -21,6 +21,7 @@ This is a normal Telegram bot, not a Telegram Mini App and not a website. Users 
 - Info Bot screen with configurable Owner and Channel links
 - Customer purchase pages use a cleaner single-message flow for product, day/variant and price selection
 - Purchase flow includes quantity selection, confirmation page, and success page with monospace license keys
+- Out-of-stock variants show Stock Out and cannot open quantity, custom quantity, or confirm purchase
 - USD prices display with `$` instead of the text `USD`
 - Delivered keys and invite links are sent as separate copy-friendly messages
 - Manual top-up request and admin approval

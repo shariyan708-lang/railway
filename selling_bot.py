@@ -1752,7 +1752,7 @@ class BotApp:
         message_id = int(query["message"]["message_id"])
         data = query.get("data") or ""
         user = self.store.upsert_user(query["from"])
-        if data != "verify":
+        if data not in {"verify", "u:stockout"} and not data.startswith("u:qcustom:"):
             self.api.answer_callback(query["id"])
 
         if data.startswith("adm:") or data.startswith("ap:") or data.startswith("av:") or data.startswith("au:") or data.startswith("at:"):
@@ -1794,6 +1794,9 @@ class BotApp:
 
         if data == "u:home":
             self.show_user_home(chat_id, user, message_id=message_id)
+        elif data == "u:stockout":
+            self.api.answer_callback(query["id"], "This option is stock out right now.", alert=True)
+            return
         elif data == "u:products":
             self.show_products(chat_id, user_id, message_id=message_id)
         elif data.startswith("u:p:"):
@@ -1807,6 +1810,12 @@ class BotApp:
             self.show_confirm_purchase(chat_id, user_id, int(raw_variant), int(raw_qty), message_id=message_id)
         elif data.startswith("u:qcustom:"):
             variant_id = int(data.rsplit(":", 1)[1])
+            variant = self.store.variant(variant_id)
+            if not variant or int(variant["stock_count"]) <= 0:
+                self.api.answer_callback(query["id"], "This option is stock out right now.", alert=True)
+                self.show_quantity(chat_id, user_id, variant_id, message_id=message_id)
+                return
+            self.api.answer_callback(query["id"])
             self.store.set_state(user_id, "custom_quantity", {"variant_id": variant_id})
             self.api.send_message(chat_id, "✏️ Send quantity number.\nExample: 5\n\n/cancel to stop.", self.user_keyboard())
         elif data.startswith("u:confirm:"):
@@ -2088,11 +2097,17 @@ class BotApp:
         for v in variants:
             price = custom_prices.get(int(v["id"]), int(v["price_cents"]))
             duration = self.duration_label(int(v["days"]))
+            stock_count = int(v["stock_count"])
+            stock_label = f"{html_code(stock_count)} available" if stock_count > 0 else html_code("Stock Out")
+            option_icon = "✅" if stock_count > 0 else "⛔"
             lines.append(
-                f"✅ <b>{html_escape(duration)}</b>\n"
+                f"{option_icon} <b>{html_escape(duration)}</b>\n"
                 f"┣ 💵 Price: {html_code(money(price, self.currency()))}\n"
-                f"┗ 📦 Stock: {html_code(v['stock_count'])} available\n"
+                f"┗ 📦 Stock: {stock_label}\n"
             )
+            if stock_count <= 0:
+                rows.append([{"text": f"⛔ {duration} - Stock Out", "callback_data": "u:stockout"}])
+                continue
             rows.append(
                 [
                     {
@@ -2121,6 +2136,19 @@ class BotApp:
         balance = int(user["balance_cents"]) if user else 0
         stock_count = int(variant["stock_count"])
         duration = self.duration_label(int(variant["days"]))
+        if stock_count <= 0:
+            text = (
+                "📦 <b>STOCK OUT</b>\n"
+                f"{LINE}\n\n"
+                "📦 <b>Product Details</b>\n"
+                f"┣ {product_icon_html(variant['product_emoji'])} {html_code(variant['product_title'])}\n"
+                f"┣ ⏱ Duration: {html_code(int(variant['days']))} Days\n"
+                f"┗ 📦 Available: {html_code('Stock Out')}\n\n"
+                "⚠️ <i>This option has no available keys right now.</i>"
+            )
+            keyboard = {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": f"u:p:{variant['product_id']}"}]]}
+            self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
+            return
         text = (
             "🛒 <b>SELECT QUANTITY</b>\n"
             f"{LINE}\n\n"
@@ -2150,6 +2178,16 @@ class BotApp:
         self.page(chat_id, text, {"inline_keyboard": rows}, message_id, parse_mode="HTML")
 
     def handle_custom_quantity(self, chat_id: int, user_id: int, text: str, data: dict[str, Any]) -> None:
+        variant = self.store.variant(int(data["variant_id"]))
+        if not variant or int(variant["stock_count"]) <= 0:
+            self.store.clear_state(user_id)
+            self.api.send_message(
+                chat_id,
+                "📦 <b>STOCK OUT</b>\n\nThis option has no available keys right now.",
+                self.user_keyboard(),
+                parse_mode="HTML",
+            )
+            return
         if not text.isdigit():
             self.api.send_message(chat_id, "Send a valid quantity number.\nExample: 5\n\n/cancel to stop.")
             return
@@ -2179,6 +2217,16 @@ class BotApp:
         balance = int(user["balance_cents"]) if user else 0
         stock_count = int(variant["stock_count"])
         duration = self.duration_label(int(variant["days"]))
+        if stock_count <= 0:
+            text = (
+                "📦 <b>STOCK OUT</b>\n"
+                f"{LINE}\n\n"
+                f"{product_icon_html(variant['product_emoji'])} {html_code(variant['product_title'])}\n"
+                f"⏱ Duration: {html_code(int(variant['days']))} Days\n\n"
+                "⚠️ <i>This option has no available keys right now.</i>"
+            )
+            self.page(chat_id, text, {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": f"u:p:{variant['product_id']}"}]]}, message_id, parse_mode="HTML")
+            return
         if stock_count < quantity:
             text = (
                 "📦 <b>NOT ENOUGH STOCK</b>\n\n"
