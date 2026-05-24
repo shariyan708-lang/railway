@@ -49,6 +49,7 @@ PG_CONNECT_TIMEOUT=10
 PG_KEEPALIVES_IDLE=30
 PG_KEEPALIVES_INTERVAL=10
 PG_KEEPALIVES_COUNT=5
+PG_RECONNECT_LOG_SECONDS=60
 BROADCAST_DELAY_SECONDS=0.035
 ```
 
@@ -83,6 +84,7 @@ python selling_bot.py --smoke-test
    - `PG_KEEPALIVES_IDLE` optional
    - `PG_KEEPALIVES_INTERVAL` optional
    - `PG_KEEPALIVES_COUNT` optional
+   - `PG_RECONNECT_LOG_SECONDS` optional
    - `BROADCAST_DELAY_SECONDS` optional
 5. Render start command:
 
@@ -109,6 +111,7 @@ This bot uses Telegram long polling, so it should be deployed as a single Render
    - `PG_KEEPALIVES_IDLE` optional
    - `PG_KEEPALIVES_INTERVAL` optional
    - `PG_KEEPALIVES_COUNT` optional
+   - `PG_RECONNECT_LOG_SECONDS` optional
    - `BROADCAST_DELAY_SECONDS` optional
 6. Railway will use `railway.json` and run:
 

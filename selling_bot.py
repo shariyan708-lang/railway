@@ -130,12 +130,21 @@ def parse_admin_ids(raw: str) -> set[int]:
     return ids
 
 
+def float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 class Store:
     def __init__(self, db_path: Path | None = None, database_url: str = ""):
         self.lock = threading.RLock()
         self.database_url = database_url.strip()
         self.is_pg = self.database_url.startswith(("postgres://", "postgresql://"))
-        self.settings_cache_seconds = float(os.getenv("SETTINGS_CACHE_SECONDS", "5"))
+        self.settings_cache_seconds = float_env("SETTINGS_CACHE_SECONDS", 5)
+        self.pg_reconnect_log_seconds = float_env("PG_RECONNECT_LOG_SECONDS", 60)
+        self._last_pg_reconnect_log = 0.0
         self._settings_cache: dict[str, str] | None = None
         self._settings_cache_until = 0.0
         self._channels_cache: dict[bool, tuple[float, list[Any]]] = {}
@@ -194,9 +203,20 @@ class Store:
             return False
         return isinstance(exc, (self.psycopg.OperationalError, self.psycopg.InterfaceError))
 
-    def reconnect_pg(self) -> None:
+    def log_pg_reconnect(self) -> None:
+        if self.pg_reconnect_log_seconds < 0:
+            return
+        now = time.monotonic()
+        if now - self._last_pg_reconnect_log < self.pg_reconnect_log_seconds:
+            return
+        self._last_pg_reconnect_log = now
+        print("Database connection lost; reconnecting to PostgreSQL.", flush=True)
+
+    def reconnect_pg(self, *, log: bool = False) -> None:
         if not self.is_pg:
             return
+        if log:
+            self.log_pg_reconnect()
         try:
             self.conn.close()
         except Exception:
@@ -205,14 +225,18 @@ class Store:
         self.invalidate_settings_cache()
         self.invalidate_channels_cache()
 
+    def ensure_pg_connection(self) -> None:
+        if self.is_pg and getattr(self.conn, "closed", False):
+            self.reconnect_pg()
+
     def retry_pg_once(self, action: Any) -> Any:
         for attempt in range(2):
             try:
+                self.ensure_pg_connection()
                 return action()
             except Exception as exc:
                 if self.is_connection_error(exc) and attempt == 0:
-                    print("Database connection lost; reconnecting to PostgreSQL.", flush=True)
-                    self.reconnect_pg()
+                    self.reconnect_pg(log=True)
                     continue
                 raise
         return None
@@ -262,7 +286,7 @@ class Store:
             self.conn.execute("BEGIN" if self.is_pg else "BEGIN IMMEDIATE")
         except Exception as exc:
             if self.is_connection_error(exc):
-                self.reconnect_pg()
+                self.reconnect_pg(log=True)
                 self.conn.execute("BEGIN")
                 return
             raise
