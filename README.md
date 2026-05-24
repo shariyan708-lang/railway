@@ -8,6 +8,7 @@ This is a normal Telegram bot, not a Telegram Mini App and not a website. Users 
 - Forced join channel setup and verification
 - Products with unlimited variants, such as 1 day, 7 days, 30 days
 - Product emoji can be set from the Telegram admin panel
+- Telegram premium/custom emoji can be used in broadcasts and product icons
 - Separate stock for each variant
 - Add stock, list available stock, delete stock by stock ID
 - User balance wallet
@@ -26,6 +27,7 @@ This is a normal Telegram bot, not a Telegram Mini App and not a website. Users 
 - Order notification to admins with user, product, variant, days and price
 - Admin order/top-up notifications include View Details and User Orders buttons
 - Admin-managed redeem codes with value and max usage limit
+- Redeem opens a Gift System screen first, then asks users to paste their Gift Code
 - Profile page is clean, with separate order history and full TXT export
 - Main customer UI keeps the classic Buy Key, Invite Friends, Profile, Info Bot and Redeem buttons
 - Admin maintenance mode to pause customer access and notify users when the bot is active again

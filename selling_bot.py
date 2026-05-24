@@ -80,6 +80,61 @@ def html_bold(value: Any) -> str:
     return f"<b>{html_escape(value)}</b>"
 
 
+def html_unescape(value: Any) -> str:
+    return (
+        str(value if value is not None else "")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+    )
+
+
+def utf16_slice(text: str, offset: int, length: int) -> str:
+    try:
+        raw = text.encode("utf-16-le")
+        part = raw[offset * 2 : (offset + length) * 2]
+        return part.decode("utf-16-le", errors="ignore")
+    except Exception:
+        return ""
+
+
+def normalize_product_icon(value: Any) -> str:
+    text = str(value or "\U0001f4e6").strip()
+    return text[:240] if text else "\U0001f4e6"
+
+
+def product_icon_html(value: Any) -> str:
+    text = normalize_product_icon(value)
+    if text.startswith("<tg-emoji ") and text.endswith("</tg-emoji>"):
+        return text
+    return html_escape(text)
+
+
+def product_icon_plain(value: Any) -> str:
+    text = normalize_product_icon(value)
+    if text.startswith("<tg-emoji "):
+        start = text.find(">")
+        end = text.rfind("</tg-emoji>")
+        if start >= 0 and end > start:
+            return html_unescape(text[start + 1 : end]).strip() or "\u2b50"
+        return "\u2b50"
+    return text
+
+
+def product_icon_from_message(msg: dict[str, Any]) -> str:
+    text = str(msg.get("text") or msg.get("caption") or "")
+    entities = msg.get("entities") or msg.get("caption_entities") or []
+    for entity in entities:
+        if entity.get("type") != "custom_emoji" or not entity.get("custom_emoji_id"):
+            continue
+        fallback = utf16_slice(text, int(entity.get("offset", 0)), int(entity.get("length", 1))) or "\u2b50"
+        emoji_id = html_escape(entity["custom_emoji_id"])
+        return f'<tg-emoji emoji-id="{emoji_id}">{html_escape(fallback)}</tg-emoji>'
+    if text.strip():
+        return normalize_product_icon(text.strip().split()[0])
+    return "\U0001f4e6"
+
+
 def normalize_chat_id(link: str, chat_id: str) -> str:
     raw = (chat_id or "").strip()
     source = raw or (link or "").strip()
@@ -863,7 +918,7 @@ class Store:
 
     def add_product(self, title: str, description: str = "", emoji: str = "📦") -> int:
         stamp = now_iso()
-        emoji = (emoji or "📦").strip()[:8]
+        emoji = normalize_product_icon(emoji)
         if self.is_pg:
             row = self.execute(
                 """
@@ -886,7 +941,7 @@ class Store:
     def set_product_emoji(self, product_id: int, emoji: str) -> None:
         self.execute(
             "UPDATE products SET emoji = ?, updated_at = ? WHERE id = ?",
-            ((emoji or "📦").strip()[:8], now_iso(), product_id),
+            (normalize_product_icon(emoji), now_iso(), product_id),
         )
 
     def toggle_product(self, product_id: int) -> None:
@@ -1769,6 +1824,8 @@ class BotApp:
             self.show_info_bot(chat_id, message_id=message_id)
         elif data == "u:redeem":
             self.show_redeem(chat_id, user_id, message_id=message_id)
+        elif data == "u:redeem_start":
+            self.show_redeem_prompt(chat_id, user_id)
         elif data == "u:balance":
             self.show_balance(chat_id, user_id, message_id=message_id)
         elif data == "u:topup":
@@ -1997,7 +2054,7 @@ class BotApp:
         if not products:
             self.page(chat_id, "🛒 BUY KEY\n\nNo products are available right now.", self.user_keyboard(), message_id)
             return
-        rows = [[{"text": f"{p['emoji'] or '📦'} {p['title']}", "callback_data": f"u:p:{p['id']}"}] for p in products]
+        rows = [[{"text": f"{product_icon_plain(p['emoji'])} {p['title']}", "callback_data": f"u:p:{p['id']}"}] for p in products]
         self.page(chat_id, "🛒 BUY KEY\n\nSelect a product:", {"inline_keyboard": rows}, message_id)
 
     def show_product_variants(self, chat_id: int, user_id: int, product_id: int, message_id: int | None = None) -> None:
@@ -2014,7 +2071,7 @@ class BotApp:
         balance = int(user["balance_cents"]) if user else 0
         custom_prices = self.store.custom_price_map(user_id, [int(v["id"]) for v in variants])
         lines = [
-            f"{product['emoji'] or '📦'} {html_code(product['title'])}",
+            f"{product_icon_html(product['emoji'])} {html_code(product['title'])}",
         ]
         if product["description"]:
             lines.append(f"📝 {html_escape(product['description'])}")
@@ -2068,7 +2125,7 @@ class BotApp:
             "🛒 <b>SELECT QUANTITY</b>\n"
             f"{LINE}\n\n"
             "📦 <b>Product Details</b>\n"
-            f"┣ {variant['product_emoji'] or '📦'} {html_code(variant['product_title'])}\n"
+            f"┣ {product_icon_html(variant['product_emoji'])} {html_code(variant['product_title'])}\n"
             f"┣ ⏱ Duration: {html_code(int(variant['days']))} Days\n"
             f"┣ 💵 Unit Price: {html_code(money(price, self.currency()))}\n"
             f"┗ 📦 Available: {html_code(stock_count)} keys\n\n"
@@ -2144,7 +2201,7 @@ class BotApp:
             "✅ <b>CONFIRM PURCHASE</b>\n"
             f"{LINE}\n\n"
             "📦 <b>Order Summary</b>\n"
-            f"┣ {variant['product_emoji'] or '📦'} {html_code(variant['product_title'])}\n"
+            f"┣ {product_icon_html(variant['product_emoji'])} {html_code(variant['product_title'])}\n"
             f"┣ ⏱ Duration: {html_code(int(variant['days']))} Days\n"
             f"┣ 📦 Quantity: {html_code(quantity)}\n"
             f"┗ 💵 Total: {html_code(money(total, self.currency()))}\n\n"
@@ -2189,7 +2246,7 @@ class BotApp:
             f"🎉 <b>{html_escape(self.store.setting('order_success_text', 'PURCHASE SUCCESSFUL!'))}</b>\n"
             f"{LINE}\n\n"
             "📦 <b>Order Details</b>\n"
-            f"┣ {variant['product_emoji'] or '📦'} {html_code(variant['product_title'])}\n"
+            f"┣ {product_icon_html(variant['product_emoji'])} {html_code(variant['product_title'])}\n"
             f"┣ ⏱ Duration: {html_code(int(variant['days']))} Days\n"
             f"┣ 📦 Quantity: {html_code(result.get('quantity', quantity))}\n"
             f"┗ 💵 Total Paid: {html_code(money(result['price_cents'], self.currency()))}\n\n"
@@ -2214,7 +2271,7 @@ class BotApp:
             "🛒 New order\n"
             f"🧾 Order ID: {result['order_id']}\n"
             f"👤 User ID: {user_id}\n"
-            f"{variant['product_emoji'] or '📦'} Product: {variant['product_title']}\n"
+            f"{product_icon_plain(variant['product_emoji'])} Product: {variant['product_title']}\n"
             f"⏳ Duration: {duration}\n"
             f"📦 Quantity: {result.get('quantity', quantity)}\n"
             f"💰 Total: {money(result['price_cents'], self.currency())}",
@@ -2230,40 +2287,50 @@ class BotApp:
         self.api.send_message(chat_id, self.store.setting("payment_methods"), self.user_keyboard())
 
     def show_redeem(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
+        self.store.clear_state(user_id)
+        text = "\U0001f381 <b>GIFT SYSTEM</b>\n\nChoose an option below:"
+        keyboard = {"inline_keyboard": [[{"text": "\u2705 REDEEM", "callback_data": "u:redeem_start"}]]}
+        self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
+
+    def show_redeem_prompt(self, chat_id: int, user_id: int) -> None:
         self.store.set_state(user_id, "redeem_code")
         text = (
-            "🎁 <b>REDEEM CODE</b>\n"
+            "\U0001f381 <b>REDEEM GIFT CODE</b>\n"
             f"{LINE}\n\n"
-            "Send your redeem code to claim balance.\n\n"
-            "Example:\n"
-            f"{html_code('FREE10')}\n\n"
-            "/cancel to stop."
+            "\U0001f4ac <i>Please paste your Gift Code below:</i>\n"
+            f"{LINE}"
         )
-        keyboard = {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": "u:home"}]]}
-        self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
+        self.api.send_message(chat_id, text, parse_mode="HTML")
 
     def handle_redeem_claim(self, chat_id: int, user_id: int, text: str) -> None:
         code = text.strip().upper()
         if not code:
-            self.api.send_message(chat_id, "Send a valid redeem code.\n/cancel to stop.")
+            self.api.send_message(chat_id, "\U0001f4ac Please paste a valid Gift Code.\n/cancel to stop.")
             return
         result = self.store.claim_redeem_code(user_id, code)
         self.store.clear_state(user_id)
         if not result.get("ok"):
             reason = result.get("reason")
             messages = {
-                "invalid": "Invalid or inactive redeem code.",
-                "already_claimed": "You already claimed this redeem code.",
-                "used_up": "This redeem code has reached its usage limit.",
+                "invalid": "Invalid or inactive Gift Code.",
+                "already_claimed": "You already claimed this Gift Code.",
+                "used_up": "This Gift Code has reached its usage limit.",
             }
-            self.api.send_message(chat_id, f"❌ {messages.get(reason, 'Redeem failed.')}", self.user_keyboard())
+            self.api.send_message(
+                chat_id,
+                "\u274c <b>INVALID GIFT CODE</b>\n\n"
+                f"{html_escape(messages.get(reason, 'Redeem failed.'))}",
+                self.user_keyboard(),
+                parse_mode="HTML",
+            )
             return
         self.api.send_message(
             chat_id,
-            "✅ <b>REDEEM SUCCESSFUL</b>\n\n"
-            f"🎁 Code: {html_code(result['code'])}\n"
-            f"💰 Added: {html_bold(money(result['amount_cents'], self.currency()))}\n"
-            f"💳 New Balance: {html_bold(money(result['new_balance_cents'], self.currency()))}",
+            "\u2705 <b>GIFT CODE CLAIMED</b>\n"
+            f"{LINE}\n\n"
+            f"\U0001f381 Code: {html_code(result['code'])}\n"
+            f"\U0001f4b0 Added Balance: {html_bold(money(result['amount_cents'], self.currency()))}\n"
+            f"\U0001f4b3 New Balance: {html_bold(money(result['new_balance_cents'], self.currency()))}",
             self.user_keyboard(),
             parse_mode="HTML",
         )
@@ -2300,7 +2367,7 @@ class BotApp:
             date_text = str(o["created_at"] or "")[:10]
             duration = f"{int(o['days'] or 0)}d"
             lines.append(
-                f"{index}. {o['product_emoji'] or '📦'} {html_escape(o['product_title'])} ({duration})\n"
+                f"{index}. {product_icon_html(o['product_emoji'])} {html_escape(o['product_title'])} ({duration})\n"
                 f"🔑 {html_code(key_text)}\n"
                 f"{html_bold(money(o['price_cents'], self.currency()))} · {html_escape(date_text)}\n"
             )
@@ -2324,7 +2391,7 @@ class BotApp:
         for index, o in enumerate(orders, start=1):
             key_text = str(o["delivered_content"] or "-").strip()
             duration = f"{int(o['days'] or 0)}d"
-            lines.append(f"{index}. {o['product_emoji'] or '📦'} {o['product_title']} ({duration})")
+            lines.append(f"{index}. {product_icon_plain(o['product_emoji'])} {o['product_title']} ({duration})")
             lines.append(f"Key: {key_text}")
             lines.append(f"Price: {money(o['price_cents'], self.currency())}")
             lines.append(f"Date: {str(o['created_at'])[:10]}")
@@ -2421,7 +2488,7 @@ class BotApp:
             self.admin_products(chat_id, message_id=message_id)
         elif data == "adm:add_product":
             self.store.set_state(admin_id, "add_product")
-            self.api.send_message(chat_id, "Send product info:\nProduct name\nDescription optional\n\nDefault emoji is 📦. You can set emoji from product detail after creating it.\n\n/cancel to stop.")
+            self.api.send_message(chat_id, "Send product info:\nProduct name\nDescription optional\n\nDefault icon is 📦. After creating it, open product detail > Set Emoji to use a normal emoji or Telegram premium/custom emoji.\n\n/cancel to stop.")
         elif data.startswith("ap:"):
             self.handle_product_admin(chat_id, admin_id, data, message_id)
         elif data.startswith("av:"):
@@ -2457,7 +2524,7 @@ class BotApp:
             self.handle_user_admin(chat_id, admin_id, data, message_id)
         elif data == "adm:broadcast":
             self.store.set_state(admin_id, "broadcast")
-            self.api.send_message(chat_id, "Send the message/media to broadcast to all users.\n/cancel to stop.")
+            self.api.send_message(chat_id, "Send the message/media to broadcast to all users.\n\nPremium/custom emoji, stickers, photos, videos and formatted text are supported. The bot will copy your exact message.\n\n/cancel to stop.")
         elif data == "adm:dm":
             self.store.set_state(admin_id, "dm_target")
             self.api.send_message(chat_id, "Send target user ID.\n/cancel to stop.")
@@ -2525,8 +2592,9 @@ class BotApp:
         ]
         for p in self.store.products(active_only=False):
             status = "active" if int(p["active"]) else "hidden"
-            text.append(f"#{p['id']} {p['emoji'] or '📦'} {p['title']} - {status}")
-            rows.append([{"text": f"#{p['id']} {p['emoji'] or '📦'} {p['title']}", "callback_data": f"ap:view:{p['id']}"}])
+            icon = product_icon_plain(p["emoji"])
+            text.append(f"#{p['id']} {icon} {p['title']} - {status}")
+            rows.append([{"text": f"#{p['id']} {icon} {p['title']}", "callback_data": f"ap:view:{p['id']}"}])
         rows.append([{"text": "➕ Add Product", "callback_data": "adm:add_product"}, {"text": "⬅️ Back", "callback_data": "adm:home"}])
         self.page(chat_id, "\n".join(text) if len(text) > 5 else "No products yet.", {"inline_keyboard": rows}, message_id)
 
@@ -2570,7 +2638,7 @@ class BotApp:
             self.api.send_message(chat_id, "Send variant info:\nVariant title\nDays\nPrice\n\nExample:\n7 Day\n7\n12.50")
         elif action == "emoji":
             self.store.set_state(admin_id, "set_product_emoji", {"product_id": product_id})
-            self.api.send_message(chat_id, "Send one emoji for this product.\nExample: 💎")
+            self.api.send_message(chat_id, "Send one icon for this product.\n\nYou can send a normal emoji or a Telegram premium/custom emoji.\nExample: 💎")
         elif action == "toggle":
             self.store.toggle_product(product_id)
             self.admin_product_detail(chat_id, product_id, message_id=message_id)
@@ -2589,7 +2657,7 @@ class BotApp:
             "━━━━━━━━━━━━━━━━━━━━",
             "Use this page to add variants, set emoji, hide/show product or delete it.",
             "",
-            f"Product #{product['id']}: {product['emoji'] or '📦'} {product['title']}",
+            f"Product #{product['id']}: {product_icon_plain(product['emoji'])} {product['title']}",
             f"Status: {'✅ active' if int(product['active']) else '❌ hidden'}",
             f"Description: {product['description'] or '-'}",
             "",
@@ -2920,18 +2988,100 @@ class BotApp:
         rows.append([{"text": "Back", "callback_data": "adm:home"}])
         self.page(chat_id, "\n\n".join(lines), {"inline_keyboard": rows}, message_id)
 
+    def balance_user_notice(self, amount: int, new_balance: int, source: str = "admin") -> str:
+        if amount >= 0:
+            title = "\U0001f4b3 <b>WALLET BALANCE ADDED</b>"
+            change_label = "\u2795 Amount Added"
+            note = "Your balance is now available for purchases."
+        else:
+            title = "\U0001f4b3 <b>WALLET BALANCE UPDATED</b>"
+            change_label = "\u2796 Amount Deducted"
+            note = "Your wallet balance has been updated by admin."
+        if source == "topup":
+            note = "Your payment has been approved and the balance is ready to use."
+        return (
+            f"{title}\n"
+            f"{LINE}\n\n"
+            f"{change_label}: {html_bold(money(abs(amount), self.currency()))}\n"
+            f"\U0001f4b0 Current Balance: {html_code(money(new_balance, self.currency()))}\n\n"
+            f"\u2705 <i>{html_escape(note)}</i>"
+        )
+
+    def balance_admin_notice(
+        self,
+        user_id: int,
+        amount: int,
+        old_balance: int,
+        new_balance: int,
+        source: str = "Manual adjustment",
+    ) -> str:
+        action = "Added" if amount >= 0 else "Deducted"
+        signed = f"+{money(amount, self.currency())}" if amount >= 0 else money(amount, self.currency())
+        return (
+            "\u2705 <b>BALANCE UPDATE COMPLETE</b>\n"
+            f"{LINE}\n\n"
+            f"\U0001f464 User ID: {html_code(user_id)}\n"
+            f"\U0001f9fe Source: {html_escape(source)}\n"
+            f"\U0001f4b5 {action}: {html_bold(signed)}\n"
+            f"\U0001f4ca Previous Balance: {html_code(money(old_balance, self.currency()))}\n"
+            f"\U0001f4b3 New Balance: {html_code(money(new_balance, self.currency()))}"
+        )
+
+    def topup_rejected_user_notice(self, topup_id: int, amount: int) -> str:
+        return (
+            "\u274c <b>TOP-UP REQUEST REJECTED</b>\n"
+            f"{LINE}\n\n"
+            f"\U0001f9fe Request ID: {html_code(topup_id)}\n"
+            f"\U0001f4b5 Amount: {html_bold(money(amount, self.currency()))}\n\n"
+            "<i>Please contact support if you think this was a mistake.</i>"
+        )
+
     def handle_topup_admin(self, chat_id: int, data: str, message_id: int | None = None) -> None:
         _, action, raw_id = data.split(":")
         status = "approved" if action == "approve" else "rejected"
+        before_topup = self.store.topup(int(raw_id))
+        before_user = self.store.user(int(before_topup["user_id"])) if before_topup else None
+        old_balance = int(before_user["balance_cents"]) if before_user else 0
+        was_pending = bool(before_topup and before_topup["status"] == "pending")
         topup = self.store.update_topup(int(raw_id), status)
         if not topup:
             self.page(chat_id, "Top-up not found.", self.admin_keyboard(), message_id)
             return
+        target_user_id = int(topup["user_id"])
+        amount = int(topup["amount_cents"])
+        user = self.store.user(target_user_id)
+        new_balance = int(user["balance_cents"]) if user else old_balance
+        if status == "approved" and was_pending:
+            self.page(
+                chat_id,
+                self.balance_admin_notice(target_user_id, amount, old_balance, new_balance, f"Top-up #{topup['id']} approved"),
+                self.admin_keyboard(),
+                message_id,
+                parse_mode="HTML",
+            )
+            self.api.send_message(
+                target_user_id,
+                self.balance_user_notice(amount, new_balance, source="topup"),
+                self.reply_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+        if status == "rejected":
+            self.page(
+                chat_id,
+                f"\u274c <b>TOP-UP REJECTED</b>\n{LINE}\n\n\U0001f9fe Request ID: {html_code(topup['id'])}\n\U0001f464 User ID: {html_code(target_user_id)}\n\U0001f4b5 Amount: {html_bold(money(amount, self.currency()))}",
+                self.admin_keyboard(),
+                message_id,
+                parse_mode="HTML",
+            )
+            self.api.send_message(
+                target_user_id,
+                self.topup_rejected_user_notice(int(topup["id"]), amount),
+                self.reply_keyboard(),
+                parse_mode="HTML",
+            )
+            return
         self.page(chat_id, f"Top-up #{topup['id']} {status}.", self.admin_keyboard(), message_id)
-        self.api.send_message(
-            int(topup["user_id"]),
-            f"Top-up #{topup['id']} {status}: {money(topup['amount_cents'], self.currency())}",
-        )
 
     def handle_admin_state(self, msg: dict[str, Any], state: str, data: dict[str, Any]) -> None:
         admin_id = int(msg["from"]["id"])
@@ -2949,10 +3099,15 @@ class BotApp:
                 self.api.send_message(chat_id, f"Product #{product_id} added.", self.admin_keyboard())
 
             elif state == "set_product_emoji":
-                emoji = text.strip().split()[0] if text.strip() else "📦"
-                self.store.set_product_emoji(int(data["product_id"]), emoji)
+                icon = product_icon_from_message(msg)
+                self.store.set_product_emoji(int(data["product_id"]), icon)
                 self.store.clear_state(admin_id)
-                self.api.send_message(chat_id, "Product emoji updated.", self.admin_keyboard())
+                self.api.send_message(
+                    chat_id,
+                    f"{product_icon_html(icon)} <b>Product icon updated.</b>",
+                    self.admin_keyboard(),
+                    parse_mode="HTML",
+                )
 
             elif state == "add_variant":
                 lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -3046,11 +3201,24 @@ class BotApp:
                 if state == "deduct":
                     amount = -amount
                 user_id = int(data["user_id"])
+                before_user = self.store.user(user_id)
+                old_balance = int(before_user["balance_cents"]) if before_user else 0
                 self.store.adjust_balance(user_id, amount, f"admin:{admin_id}")
                 user = self.store.user(user_id)
+                new_balance = int(user["balance_cents"]) if user else old_balance + amount
                 self.store.clear_state(admin_id)
-                self.api.send_message(chat_id, "Balance updated.", self.admin_keyboard())
-                self.api.send_message(user_id, f"Balance updated. Current balance: {money(user['balance_cents'], self.currency())}")
+                self.api.send_message(
+                    chat_id,
+                    self.balance_admin_notice(user_id, amount, old_balance, new_balance),
+                    self.admin_keyboard(),
+                    parse_mode="HTML",
+                )
+                self.api.send_message(
+                    user_id,
+                    self.balance_user_notice(amount, new_balance),
+                    self.reply_keyboard(),
+                    parse_mode="HTML",
+                )
 
             elif state == "custom_price":
                 parts = text.split()
