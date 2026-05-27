@@ -6,11 +6,13 @@ This is a normal Telegram bot, not a Telegram Mini App and not a website. Users 
 
 - Telegram-only admin panel visible only to `ADMIN_IDS`
 - Forced join channel setup and verification
+- Forced join `/start` login page appears immediately, and verification checks membership only after users tap Verify
 - Products with unlimited variants, such as 1 day, 7 days, 30 days
 - Product emoji can be set from the Telegram admin panel
 - Telegram premium/custom emoji can be used in broadcasts and product icons
 - Separate stock for each variant
 - Add stock, list available stock, delete stock by stock ID
+- Product/variant delete is safe: items with existing order history are hidden instead of breaking old orders
 - User balance wallet
 - Users list and users with balance list
 - Add or deduct user balance

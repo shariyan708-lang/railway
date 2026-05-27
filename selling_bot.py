@@ -153,6 +153,22 @@ def normalize_chat_id(link: str, chat_id: str) -> str:
     return raw
 
 
+def normalize_channel_link(link: str, chat_id: str = "") -> str:
+    raw = (link or "").strip()
+    source = raw or (chat_id or "").strip()
+    if source.startswith(("https://", "http://")):
+        return source
+    if source.startswith("t.me/"):
+        return f"https://{source}"
+    if source.startswith("@"):
+        return f"https://t.me/{source[1:]}"
+    if source.startswith("+"):
+        return f"https://t.me/{source}"
+    if source and "/" not in source and not source.lstrip("-").isdigit():
+        return f"https://t.me/{source}"
+    return raw
+
+
 def chat_id_candidates(link: str, chat_id: str) -> list[str]:
     candidates: list[str] = []
     for value in (chat_id, normalize_chat_id(link, chat_id), normalize_chat_id(link, "")):
@@ -882,10 +898,11 @@ class Store:
         return list(rows)
 
     def add_channel(self, title: str, link: str, chat_id: str) -> None:
-        cleaned_chat_id = normalize_chat_id(link, chat_id)
+        cleaned_link = normalize_channel_link(link, chat_id)
+        cleaned_chat_id = normalize_chat_id(cleaned_link, chat_id)
         self.execute(
             "INSERT INTO channels(title, link, chat_id, enabled, sort_order, created_at) VALUES(?, ?, ?, 1, 0, ?)",
-            (title.strip(), link.strip(), cleaned_chat_id, now_iso()),
+            (title.strip(), cleaned_link, cleaned_chat_id, now_iso()),
         )
         self.invalidate_channels_cache()
 
@@ -950,8 +967,18 @@ class Store:
             (now_iso(), product_id),
         )
 
-    def delete_product(self, product_id: int) -> None:
+    def product_order_count(self, product_id: int) -> int:
+        row = self.execute("SELECT COUNT(*) AS n FROM orders WHERE product_id = ?", (product_id,), one=True)
+        return int(row["n"])
+
+    def delete_product(self, product_id: int) -> str:
+        if self.product_order_count(product_id) > 0:
+            stamp = now_iso()
+            self.execute("UPDATE products SET active = 0, updated_at = ? WHERE id = ?", (stamp, product_id))
+            self.execute("UPDATE product_variants SET active = 0, updated_at = ? WHERE product_id = ?", (stamp, product_id))
+            return "hidden"
         self.execute("DELETE FROM products WHERE id = ?", (product_id,))
+        return "deleted"
 
     def variants(self, product_id: int | None = None, active_only: bool = False) -> list[Any]:
         clauses = []
@@ -1017,8 +1044,16 @@ class Store:
             (now_iso(), variant_id),
         )
 
-    def delete_variant(self, variant_id: int) -> None:
+    def variant_order_count(self, variant_id: int) -> int:
+        row = self.execute("SELECT COUNT(*) AS n FROM orders WHERE variant_id = ?", (variant_id,), one=True)
+        return int(row["n"])
+
+    def delete_variant(self, variant_id: int) -> str:
+        if self.variant_order_count(variant_id) > 0:
+            self.execute("UPDATE product_variants SET active = 0, updated_at = ? WHERE id = ?", (now_iso(), variant_id))
+            return "hidden"
         self.execute("DELETE FROM product_variants WHERE id = ?", (variant_id,))
+        return "deleted"
 
     def add_stock(self, variant_id: int, lines: list[str]) -> int:
         clean = [line.strip() for line in lines if line.strip()]
@@ -1705,6 +1740,9 @@ class BotApp:
             return
 
         command = text.split(maxsplit=1)[0].lower() if text else ""
+        if command in {"/start", "/menu"} and self.should_show_join_gate_first(user_id):
+            self.show_join_gate(chat_id)
+            return
         if command not in {"/start", "/menu"} and not self.join_ok(user_id):
             self.show_join_gate(chat_id)
             return
@@ -1871,7 +1909,9 @@ class BotApp:
     def join_keyboard(self) -> dict[str, Any]:
         rows = []
         for i, channel in enumerate(self.store.channels(enabled_only=True), start=1):
-            rows.append([{"text": f"📣 JOIN CHANNEL {i}", "url": channel["link"]}])
+            link = normalize_channel_link(str(channel["link"] or ""), str(channel["chat_id"] or ""))
+            if link.startswith(("https://", "http://")):
+                rows.append([{"text": f"📣 JOIN CHANNEL {i}", "url": link}])
         rows.append([{"text": "✅ VERIFY", "callback_data": "verify"}])
         return {"inline_keyboard": rows}
 
@@ -1917,11 +1957,26 @@ class BotApp:
         ok, _ = self.join_status(user_id)
         return ok
 
+    def should_show_join_gate_first(self, user_id: int) -> bool:
+        if self.store.setting("join_required", "1") != "1":
+            return False
+        if self.join_success_cache.get(user_id, 0) > time.monotonic():
+            return False
+        return bool(self.store.channels(enabled_only=True))
+
     def show_join_gate(self, chat_id: int) -> None:
         text = self.store.setting("join_text").strip()
         if text == "ACCESS DENIED!\n\nYou must join our channels to unlock the bot features.":
             text = "⚠️ ACCESS DENIED!\n\nYou must join our channels to unlock the bot features."
-        self.api.send_message(chat_id, text, self.join_keyboard())
+        response = self.api.send_message(chat_id, text, self.join_keyboard())
+        if response.get("ok"):
+            return
+        print("Join gate send failed:", response.get("description"), flush=True)
+        self.api.send_message(
+            chat_id,
+            text + "\n\nChannel button setup has an issue. Please contact admin.",
+            {"inline_keyboard": [[{"text": "✅ VERIFY", "callback_data": "verify"}]]},
+        )
 
     def verification_success_text(self, user: Any) -> str:
         name = str(user["first_name"] if user and user["first_name"] else "friend").strip()
@@ -2586,18 +2641,21 @@ class BotApp:
                 "Send channel info:\n"
                 "Title\n"
                 "Join link\n"
-                "Chat ID or @username\n\n"
+                "Chat ID or @username optional for public channels\n\n"
                 "Example:\n"
                 "Channel 1\n"
                 "https://t.me/yourchannel\n"
                 "@yourchannel\n\n"
-                "Bot must be admin/member in that channel for Verify to work.\n/cancel to stop.",
+                "Public channel: @username can be auto-detected from link.\n"
+                "Private channel: use invite link plus numeric chat ID, and keep bot as admin/member.\n/cancel to stop.",
             )
         elif data.startswith("adm:del_channel:"):
             self.store.delete_channel(int(data.rsplit(":", 1)[1]))
+            self.join_success_cache.clear()
             self.admin_channels(chat_id, message_id=message_id)
         elif data.startswith("adm:toggle_channel:"):
             self.store.toggle_channel(int(data.rsplit(":", 1)[1]))
+            self.join_success_cache.clear()
             self.admin_channels(chat_id, message_id=message_id)
         elif data == "adm:settings":
             self.admin_settings(chat_id, message_id=message_id)
@@ -2617,6 +2675,7 @@ class BotApp:
         elif data == "adm:toggle_join":
             current = self.store.setting("join_required", "1")
             self.store.set_setting("join_required", "0" if current == "1" else "1")
+            self.join_success_cache.clear()
             self.admin_settings(chat_id, message_id=message_id)
         elif data == "adm:toggle_referral":
             current = self.store.setting("referral_enabled", "1")
@@ -2691,8 +2750,16 @@ class BotApp:
             self.store.toggle_product(product_id)
             self.admin_product_detail(chat_id, product_id, message_id=message_id)
         elif action == "delete":
-            self.store.delete_product(product_id)
-            self.admin_products(chat_id, message_id=message_id)
+            result = self.store.delete_product(product_id)
+            if result == "hidden":
+                self.admin_product_detail(chat_id, product_id, message_id=message_id)
+                self.api.send_message(
+                    chat_id,
+                    "Product has existing order history, so it was hidden instead of permanently deleted.",
+                    self.admin_keyboard(),
+                )
+            else:
+                self.admin_products(chat_id, message_id=message_id)
 
     def admin_product_detail(self, chat_id: int, product_id: int, message_id: int | None = None) -> None:
         product = self.store.product(product_id)
@@ -2749,8 +2816,15 @@ class BotApp:
         elif action == "delete":
             variant = self.store.variant(variant_id)
             product_id = int(variant["product_id"]) if variant else 0
-            self.store.delete_variant(variant_id)
-            if product_id:
+            result = self.store.delete_variant(variant_id)
+            if result == "hidden":
+                self.admin_variant_detail(chat_id, variant_id, message_id=message_id)
+                self.api.send_message(
+                    chat_id,
+                    "Variant has existing order history, so it was hidden instead of permanently deleted.",
+                    self.admin_keyboard(),
+                )
+            elif product_id:
                 self.admin_product_detail(chat_id, product_id, message_id=message_id)
             else:
                 self.admin_products(chat_id, message_id=message_id)
@@ -3184,10 +3258,12 @@ class BotApp:
 
             elif state == "add_channel":
                 lines = [line.strip() for line in text.splitlines() if line.strip()]
-                if len(lines) < 3:
-                    self.api.send_message(chat_id, "Send:\nTitle\nJoin link\nChat ID or @username\n\nExample:\nChannel 1\nhttps://t.me/yourchannel\n@yourchannel")
+                if len(lines) < 2:
+                    self.api.send_message(chat_id, "Send:\nTitle\nJoin link\nChat ID or @username optional for public channels\n\nExample:\nChannel 1\nhttps://t.me/yourchannel\n@yourchannel")
                     return
-                self.store.add_channel(lines[0], lines[1], lines[2])
+                chat_ref = lines[2] if len(lines) >= 3 else normalize_chat_id(lines[1], "")
+                self.store.add_channel(lines[0], lines[1], chat_ref)
+                self.join_success_cache.clear()
                 self.store.clear_state(admin_id)
                 self.api.send_message(chat_id, "Channel added.", self.admin_keyboard())
 
